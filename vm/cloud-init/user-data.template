@@ -1,0 +1,31 @@
+#cloud-config
+users:
+  - default
+  - name: poc
+    gecos: MACsec PoC
+    groups: [sudo]
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    ssh_authorized_keys:
+      - @SSH_PUBLIC_KEY@
+ssh_pwauth: false
+package_update: true
+packages:
+  - build-essential
+  - meson
+  - ninja-build
+  - pkg-config
+  - libssl-dev
+  - libdpdk-dev
+  - dpdk
+  - tcpdump
+  - ethtool
+  - iproute2
+  - python3
+runcmd:
+  - [sh, -c, 'echo 1024 > /proc/sys/vm/nr_hugepages']
+  - [mkdir, -p, /mnt/huge]
+  - [mount, -t, hugetlbfs, nodev, /mnt/huge]
+  - [sh, -c, 'echo "nodev /mnt/huge hugetlbfs defaults 0 0" >> /etc/fstab']
+final_message: "MACsec PoC guest ready after $UPTIME seconds"
+

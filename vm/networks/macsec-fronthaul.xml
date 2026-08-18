@@ -1,0 +1,4 @@
+<network>
+  <name>macsec-fronthaul</name>
+  <bridge name='virbr-macsec' stp='off' delay='0'/>
+</network>
