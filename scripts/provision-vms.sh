@@ -89,7 +89,7 @@ for node in du ru; do
     fronthaul_mac="52:54:00:ae:00:12"
   fi
   virt-install --connect "$connection" \
-    --name "$name" --memory 3072 --vcpus 2 --cpu host-passthrough \
+    --name "$name" --memory 3072 --vcpus 4 --cpu host-passthrough \
     --import --osinfo ubuntu24.04 --noautoconsole \
     --disk "path=$image_dir/o-$node.qcow2,format=qcow2,bus=virtio" \
     --disk "path=$generated_dir/o-$node-seed.img,device=cdrom" \

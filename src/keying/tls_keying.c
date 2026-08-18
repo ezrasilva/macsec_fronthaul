@@ -21,7 +21,7 @@
 #include <unistd.h>
 
 #define EXPORTER_LEN 32U
-#define SAK_LEN 16U
+#define SAK_LEN 32U
 #define EXPORTER_LABEL "EXPORTER-MACSEC-PQC-v1"
 #define HYBRID_GROUP "X25519MLKEM768"
 
@@ -113,11 +113,11 @@ static SSL_CTX *create_context(bool server, const char *cert, const char *key, c
 }
 
 static bool hkdf(const uint8_t *secret, size_t secret_len,
-                 const char *info, uint8_t output[SAK_LEN])
+                 const char *info, uint8_t *output, size_t requested_len)
 {
     static const uint8_t salt[] = "macsec-pqc-poc-v1";
     EVP_PKEY_CTX *context = EVP_PKEY_CTX_new_id(EVP_PKEY_HKDF, NULL);
-    size_t output_len = SAK_LEN;
+    size_t output_len = requested_len;
     bool success = false;
 
     if (context == NULL || EVP_PKEY_derive_init(context) <= 0 ||
@@ -126,7 +126,7 @@ static bool hkdf(const uint8_t *secret, size_t secret_len,
         EVP_PKEY_CTX_set1_hkdf_key(context, secret, (int)secret_len) <= 0 ||
         EVP_PKEY_CTX_add1_hkdf_info(context, (const unsigned char *)info,
                                     (int)strlen(info)) <= 0 ||
-        EVP_PKEY_derive(context, output, &output_len) <= 0 || output_len != SAK_LEN) {
+        EVP_PKEY_derive(context, output, &output_len) <= 0 || output_len != requested_len) {
         goto done;
     }
     success = true;
@@ -148,13 +148,17 @@ static bool export_keys(SSL *ssl, const char *output_path)
     uint8_t exporter[EXPORTER_LEN];
     uint8_t du_to_ru[SAK_LEN];
     uint8_t ru_to_du[SAK_LEN];
+    uint8_t du_salt[12];
+    uint8_t ru_salt[12];
     FILE *output;
 
     if (SSL_export_keying_material(ssl, exporter, sizeof(exporter),
                                    EXPORTER_LABEL, strlen(EXPORTER_LABEL),
                                    NULL, 0, 0) != 1 ||
-        !hkdf(exporter, sizeof(exporter), "macsec-sak:du-to-ru", du_to_ru) ||
-        !hkdf(exporter, sizeof(exporter), "macsec-sak:ru-to-du", ru_to_du)) {
+        !hkdf(exporter, sizeof(exporter), "macsec-sak:du-to-ru", du_to_ru, sizeof(du_to_ru)) ||
+        !hkdf(exporter, sizeof(exporter), "macsec-sak:ru-to-du", ru_to_du, sizeof(ru_to_du)) ||
+        !hkdf(exporter, sizeof(exporter), "macsec-salt:du-to-ru", du_salt, sizeof(du_salt)) ||
+        !hkdf(exporter, sizeof(exporter), "macsec-salt:ru-to-du", ru_salt, sizeof(ru_salt))) {
         return false;
     }
     output = fopen(output_path, "w");
@@ -166,11 +170,17 @@ static bool export_keys(SSL *ssl, const char *output_path)
     write_hex(output, du_to_ru, sizeof(du_to_ru));
     fputs("\nRU_TO_DU_KEY=", output);
     write_hex(output, ru_to_du, sizeof(ru_to_du));
+    fputs("\nDU_TO_RU_SALT=", output);
+    write_hex(output, du_salt, sizeof(du_salt));
+    fputs("\nRU_TO_DU_SALT=", output);
+    write_hex(output, ru_salt, sizeof(ru_salt));
     fputc('\n', output);
     fclose(output);
     OPENSSL_cleanse(exporter, sizeof(exporter));
     OPENSSL_cleanse(du_to_ru, sizeof(du_to_ru));
     OPENSSL_cleanse(ru_to_du, sizeof(ru_to_du));
+    OPENSSL_cleanse(du_salt, sizeof(du_salt));
+    OPENSSL_cleanse(ru_salt, sizeof(ru_salt));
     return true;
 }
 

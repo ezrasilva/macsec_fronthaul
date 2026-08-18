@@ -50,9 +50,37 @@ static void store_be32(uint8_t *p, uint32_t value)
     p[3] = (uint8_t)value;
 }
 
-static bool replay_rejected(const struct macsec_rx_sa *sa, uint32_t pn)
+static void store_be64(uint8_t *p, uint64_t value)
 {
-    uint32_t distance;
+    store_be32(p, (uint32_t)(value >> 32));
+    store_be32(p + 4, (uint32_t)value);
+}
+
+static void make_xpn_nonce(uint8_t nonce[12], uint32_t ssci, uint64_t pn,
+                           const uint8_t salt[MACSEC_SALT_LEN])
+{
+    size_t i;
+    store_be32(nonce, ssci);
+    store_be64(nonce + 4, pn);
+    for (i = 0; i < 12U; i++) {
+        nonce[i] ^= salt[i];
+    }
+}
+
+static uint64_t recover_xpn(const struct macsec_rx_sa *sa, uint32_t low)
+{
+    uint64_t expected = sa->highest_pn == 0U ? 1U : sa->highest_pn + 1U;
+    uint64_t recovered = (expected & UINT64_C(0xffffffff00000000)) | low;
+    uint32_t expected_low = (uint32_t)expected;
+    if (low < expected_low && ((low ^ expected_low) & UINT32_C(0x80000000)) != 0U) {
+        recovered += UINT64_C(0x100000000);
+    }
+    return recovered;
+}
+
+static bool replay_rejected(const struct macsec_rx_sa *sa, uint64_t pn)
+{
+    uint64_t distance;
 
     if (pn == 0U) {
         return true;
@@ -65,13 +93,13 @@ static bool replay_rejected(const struct macsec_rx_sa *sa, uint32_t pn)
            (sa->replay_bitmap & (UINT64_C(1) << distance)) != 0U;
 }
 
-static void replay_accept(struct macsec_rx_sa *sa, uint32_t pn)
+static void replay_accept(struct macsec_rx_sa *sa, uint64_t pn)
 {
     if (sa->highest_pn == 0U) {
         sa->highest_pn = pn;
         sa->replay_bitmap = UINT64_C(1);
     } else if (pn > sa->highest_pn) {
-        uint32_t shift = pn - sa->highest_pn;
+        uint64_t shift = pn - sa->highest_pn;
         sa->replay_bitmap = shift >= MACSEC_MAX_REPLAY_WINDOW
                                 ? UINT64_C(1)
                                 : (sa->replay_bitmap << shift) | UINT64_C(1);
@@ -103,7 +131,7 @@ static enum macsec_status gcm_encrypt(const uint8_t key[MACSEC_KEY_LEN],
         return MACSEC_ERR_ARGUMENT;
     }
     ctx = EVP_CIPHER_CTX_new();
-    if (ctx == NULL || EVP_EncryptInit_ex2(ctx, EVP_aes_128_gcm(), key, nonce, NULL) != 1 ||
+    if (ctx == NULL || EVP_EncryptInit_ex2(ctx, EVP_aes_256_gcm(), key, nonce, NULL) != 1 ||
         EVP_EncryptUpdate(ctx, NULL, &count, aad, (int)aad_len) != 1 ||
         EVP_EncryptUpdate(ctx, output, &count, input, (int)input_len) != 1 ||
         EVP_EncryptFinal_ex(ctx, output + count, &final_count) != 1 ||
@@ -135,7 +163,7 @@ static enum macsec_status gcm_decrypt(const uint8_t key[MACSEC_KEY_LEN],
         return MACSEC_ERR_ARGUMENT;
     }
     ctx = EVP_CIPHER_CTX_new();
-    if (ctx == NULL || EVP_DecryptInit_ex2(ctx, EVP_aes_128_gcm(), key, nonce, NULL) != 1 ||
+    if (ctx == NULL || EVP_DecryptInit_ex2(ctx, EVP_aes_256_gcm(), key, nonce, NULL) != 1 ||
         EVP_DecryptUpdate(ctx, NULL, &count, aad, (int)aad_len) != 1 ||
         EVP_DecryptUpdate(ctx, output, &count, input, (int)input_len) != 1 ||
         EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG, MACSEC_ICV_LEN, (void *)tag) != 1) {
@@ -155,12 +183,15 @@ done:
 void macsec_tx_sa_init(struct macsec_tx_sa *sa,
                        const uint8_t key[MACSEC_KEY_LEN],
                        const uint8_t sci[MACSEC_SCI_LEN],
+                       const uint8_t salt[MACSEC_SALT_LEN], uint32_t ssci,
                        uint8_t association_number,
-                       uint32_t initial_pn)
+                       uint64_t initial_pn)
 {
     memset(sa, 0, sizeof(*sa));
     memcpy(sa->key, key, MACSEC_KEY_LEN);
     memcpy(sa->sci, sci, MACSEC_SCI_LEN);
+    memcpy(sa->salt, salt, MACSEC_SALT_LEN);
+    sa->ssci = ssci;
     sa->association_number = association_number & TCI_AN_MASK;
     sa->next_pn = initial_pn;
 }
@@ -168,12 +199,15 @@ void macsec_tx_sa_init(struct macsec_tx_sa *sa,
 void macsec_rx_sa_init(struct macsec_rx_sa *sa,
                        const uint8_t key[MACSEC_KEY_LEN],
                        const uint8_t sci[MACSEC_SCI_LEN],
+                       const uint8_t salt[MACSEC_SALT_LEN], uint32_t ssci,
                        uint8_t association_number,
                        uint8_t replay_window)
 {
     memset(sa, 0, sizeof(*sa));
     memcpy(sa->key, key, MACSEC_KEY_LEN);
     memcpy(sa->sci, sci, MACSEC_SCI_LEN);
+    memcpy(sa->salt, salt, MACSEC_SALT_LEN);
+    sa->ssci = ssci;
     sa->association_number = association_number & TCI_AN_MASK;
     sa->replay_window = replay_window == 0U || replay_window > MACSEC_MAX_REPLAY_WINDOW
                             ? MACSEC_MAX_REPLAY_WINDOW
@@ -209,11 +243,10 @@ enum macsec_status macsec_protect(struct macsec_tx_sa *sa,
     store_be16(secure_frame + 12, MACSEC_ETHERTYPE);
     secure_frame[14] = (uint8_t)(TCI_PROFILE | sa->association_number);
     secure_frame[15] = protected_len < 48U ? (uint8_t)protected_len : 0U;
-    store_be32(secure_frame + 16, sa->next_pn);
+    store_be32(secure_frame + 16, (uint32_t)sa->next_pn);
     memcpy(secure_frame + 20, sa->sci, MACSEC_SCI_LEN);
 
-    memcpy(nonce, sa->sci, MACSEC_SCI_LEN);
-    store_be32(nonce + MACSEC_SCI_LEN, sa->next_pn);
+    make_xpn_nonce(nonce, sa->ssci, sa->next_pn, sa->salt);
     tag = secure_frame + SECURE_HEADER_LEN + protected_len;
     status = aead_backend != NULL
                  ? aead_backend(true, sa->key, nonce, secure_frame,
@@ -228,7 +261,7 @@ enum macsec_status macsec_protect(struct macsec_tx_sa *sa,
     }
 
     *secure_len = SECURE_HEADER_LEN + protected_len + MACSEC_ICV_LEN;
-    sa->next_pn = sa->next_pn == UINT32_MAX ? 0U : sa->next_pn + 1U;
+    sa->next_pn = sa->next_pn == UINT64_MAX ? 0U : sa->next_pn + 1U;
     return MACSEC_OK;
 }
 
@@ -244,7 +277,7 @@ enum macsec_status macsec_unprotect(struct macsec_rx_sa *sa,
     uint8_t nonce[12];
     uint8_t tci;
     uint8_t short_length;
-    uint32_t pn;
+    uint64_t pn;
     enum macsec_status status;
 
     if (sa == NULL || secure_frame == NULL || plain_frame == NULL || plain_len == NULL) {
@@ -272,12 +305,11 @@ enum macsec_status macsec_unprotect(struct macsec_rx_sa *sa,
         return MACSEC_ERR_CAPACITY;
     }
 
-    pn = load_be32(secure_frame + 16);
+    pn = recover_xpn(sa, load_be32(secure_frame + 16));
     if (replay_rejected(sa, pn)) {
         return MACSEC_ERR_REPLAY;
     }
-    memcpy(nonce, sa->sci, MACSEC_SCI_LEN);
-    store_be32(nonce + MACSEC_SCI_LEN, pn);
+    make_xpn_nonce(nonce, sa->ssci, pn, sa->salt);
     memcpy(plain_frame, secure_frame, MAC_ADDRESSES_LEN);
     if (aead_backend != NULL) {
         uint8_t tag[MACSEC_ICV_LEN];

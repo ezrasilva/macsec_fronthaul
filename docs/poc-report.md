@@ -2,8 +2,8 @@
 
 ## Escopo validado
 
-- MACsec restrito com AES-128-GCM, SCI explícito, PN de 32 bits, ICV de 16
-  bytes e janela anti-replay.
+- MACsec restrito com GCM-AES-XPN-256, SCI explícito, PN de 64 bits, SSCI,
+  salt, ICV de 16 bytes e janela anti-replay.
 - Dataplane DPDK entre VMs O-DU e O-RU.
 - AES-GCM pelo `rte_cryptodev`/`crypto_aesni_gcm`.
 - Pipeline concorrente com lcore de IO, lcore de criptografia e filas
@@ -28,8 +28,8 @@
 
 ## Ensaio de carga PCAP
 
-O pipeline processou 100.000 frames eCPRI em 138.887 µs, correspondendo a
-aproximadamente 720.010 pacotes/s. Não ocorreram erros de autenticação,
+O pipeline XPN-256 processou 100.000 frames eCPRI em 147.206 µs, correspondendo
+a aproximadamente 679.320 pacotes/s. Não ocorreram erros de autenticação,
 formato, replay, alocação, transmissão ou saturação de `rte_ring`. A captura
 MACsec resultante contém todos os frames com PN final 100.000.
 
@@ -69,7 +69,7 @@ Os arquivos resultantes ficam em `artifacts/evidence`, acompanhados de
 ## Limitações remanescentes
 
 - O perfil não é uma implementação completa/conformante de IEEE 802.1AE.
-- O estágio de IO reúne RX e TX porque as VMs possuem dois vCPUs.
+- As VMs usam quatro vCPUs e lcores distintos para RX, criptografia e TX.
 - As medições virtualizadas não caracterizam latência, jitter ou throughput do
   fronthaul físico.
 - Ainda faltam vetores oficiais de conformidade e ensaio de carga sustentada.

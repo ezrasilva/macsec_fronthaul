@@ -7,8 +7,8 @@ OpenRAN@Brasil.
 
 ## Funcionalidades
 
-- perfil MACsec com AES-128-GCM, SCI explícito, PN de 32 bits, AN, ICV de 16
-  bytes e janela anti-replay;
+- perfil MACsec com GCM-AES-XPN-256, SCI explícito, PN de 64 bits, SSCI, salt,
+  AN, ICV de 16 bytes e janela anti-replay;
 - AES-GCM no dataplane pelo `rte_cryptodev` e PMD `crypto_aesni_gcm`;
 - pipeline concorrente com lcore de IO, lcore de criptografia e filas
   `rte_ring` SPSC;
@@ -140,7 +140,7 @@ de comando.
 
 - Perfil restrito, não uma implementação completa de IEEE 802.1AE.
 - Ainda não há validação por vetores oficiais de conformidade IEEE 802.1AE.
-- RX e TX compartilham o lcore de IO porque cada VM possui dois vCPUs.
+- As VMs usam quatro vCPUs; RX, criptografia e TX ocupam lcores distintos.
 - Latência, jitter e throughput definitivos devem ser medidos no testbed.
 
 ## Segurança

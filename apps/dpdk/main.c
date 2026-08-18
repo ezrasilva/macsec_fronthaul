@@ -55,6 +55,10 @@ struct app_config {
     uint8_t rx_key[MACSEC_KEY_LEN];
     uint8_t tx_sci[MACSEC_SCI_LEN];
     uint8_t rx_sci[MACSEC_SCI_LEN];
+    uint8_t tx_salt[MACSEC_SALT_LEN];
+    uint8_t rx_salt[MACSEC_SALT_LEN];
+    uint32_t tx_ssci;
+    uint32_t rx_ssci;
     uint8_t association_number;
     uint8_t replay_window;
     uint32_t initial_pn;
@@ -64,6 +68,10 @@ struct app_config {
     bool have_rx_key;
     bool have_tx_sci;
     bool have_rx_sci;
+    bool have_tx_salt;
+    bool have_rx_salt;
+    bool have_tx_ssci;
+    bool have_rx_ssci;
     const char *rekey_file;
     uint32_t exit_on_idle_ms;
 };
@@ -97,6 +105,9 @@ struct pipeline_context {
     volatile uint8_t *active_tx_an;
     struct app_stats *stats;
     volatile bool worker_busy;
+    volatile bool tx_busy;
+    uint16_t plain_port;
+    uint16_t secure_port;
 };
 
 static volatile sig_atomic_t force_quit;
@@ -162,7 +173,7 @@ static bool parse_u32(const char *text, uint32_t minimum, uint32_t maximum, uint
 static void usage(const char *program)
 {
     fprintf(stderr,
-            "Usage: %s [EAL options] -- --tx-key HEX32 --rx-key HEX32\\\n\n"
+            "Usage: %s [EAL options] -- --tx-key HEX64 --rx-key HEX64\\\n\n"
             "       --tx-sci HEX16 --rx-sci HEX16 [options]\n"
             "  --plain-port N       unprotected Ethernet port (default 0)\n"
             "  --secure-port N      protected Ethernet port (default 1)\n"
@@ -170,6 +181,7 @@ static void usage(const char *program)
             "  --initial-pn N       first transmit PN (default 1)\n"
             "  --replay-window N    receive window, 1..64 (default 64)\n"
             "  --rekey-file PATH    file containing TX_KEY and RX_KEY\n"
+            "  --tx-salt HEX24 --rx-salt HEX24 --tx-ssci N --rx-ssci N\n"
             "  --exit-on-idle-ms N  stop after PCAP input becomes idle\n",
             program);
 }
@@ -187,6 +199,10 @@ static bool parse_app_args(int argc, char **argv, struct app_config *config)
         {"initial-pn", required_argument, NULL, 'i'},
         {"replay-window", required_argument, NULL, 'w'},
         {"rekey-file", required_argument, NULL, 'r'},
+        {"tx-salt", required_argument, NULL, 't'},
+        {"rx-salt", required_argument, NULL, 'T'},
+        {"tx-ssci", required_argument, NULL, 'c'},
+        {"rx-ssci", required_argument, NULL, 'C'},
         {"exit-on-idle-ms", required_argument, NULL, 'x'},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0}
@@ -204,14 +220,14 @@ static bool parse_app_args(int argc, char **argv, struct app_config *config)
         case 'k':
             config->have_tx_key = parse_hex(optarg, config->tx_key, sizeof(config->tx_key));
             if (!config->have_tx_key) {
-                fprintf(stderr, "invalid --tx-key: expected 32 hexadecimal characters\n");
+                fprintf(stderr, "invalid --tx-key: expected 64 hexadecimal characters\n");
                 return false;
             }
             break;
         case 'K':
             config->have_rx_key = parse_hex(optarg, config->rx_key, sizeof(config->rx_key));
             if (!config->have_rx_key) {
-                fprintf(stderr, "invalid --rx-key: expected 32 hexadecimal characters\n");
+                fprintf(stderr, "invalid --rx-key: expected 64 hexadecimal characters\n");
                 return false;
             }
             break;
@@ -260,6 +276,22 @@ static bool parse_app_args(int argc, char **argv, struct app_config *config)
         case 'r':
             config->rekey_file = optarg;
             break;
+        case 't':
+            config->have_tx_salt = parse_hex(optarg, config->tx_salt, sizeof(config->tx_salt));
+            if (!config->have_tx_salt) return false;
+            break;
+        case 'T':
+            config->have_rx_salt = parse_hex(optarg, config->rx_salt, sizeof(config->rx_salt));
+            if (!config->have_rx_salt) return false;
+            break;
+        case 'c':
+            config->have_tx_ssci = parse_u32(optarg, 0, UINT32_MAX, &config->tx_ssci);
+            if (!config->have_tx_ssci) return false;
+            break;
+        case 'C':
+            config->have_rx_ssci = parse_u32(optarg, 0, UINT32_MAX, &config->rx_ssci);
+            if (!config->have_rx_ssci) return false;
+            break;
         case 'x':
             if (!parse_u32(optarg, 1, 60000, &config->exit_on_idle_ms)) {
                 return false;
@@ -273,6 +305,8 @@ static bool parse_app_args(int argc, char **argv, struct app_config *config)
     }
     if (!config->have_tx_key || !config->have_rx_key ||
         !config->have_tx_sci || !config->have_rx_sci ||
+        !config->have_tx_salt || !config->have_rx_salt ||
+        !config->have_tx_ssci || !config->have_rx_ssci ||
         config->plain_port == config->secure_port) {
         usage(argv[0]);
         return false;
@@ -649,6 +683,21 @@ static void transmit_stage(uint16_t plain_port, uint16_t secure_port,
     }
 }
 
+static int tx_stage(void *argument)
+{
+    struct pipeline_context *pipeline = argument;
+    while (!force_quit || !rte_ring_empty(pipeline->tx_ring)) {
+        if (rte_ring_empty(pipeline->tx_ring)) {
+            rte_pause();
+            continue;
+        }
+        pipeline->tx_busy = true;
+        transmit_stage(pipeline->plain_port, pipeline->secure_port, pipeline);
+        pipeline->tx_busy = false;
+    }
+    return 0;
+}
+
 static void print_stats(const struct app_stats *stats)
 {
     printf("\rprotected=%" PRIu64 " unprotected=%" PRIu64
@@ -675,6 +724,7 @@ int main(int argc, char **argv)
     struct crypto_backend crypto;
     struct pipeline_context pipeline;
     unsigned worker_lcore;
+    unsigned tx_lcore;
     uint64_t next_stats;
     uint64_t started_cycles;
     uint64_t last_input_cycles = 0;
@@ -727,8 +777,10 @@ int main(int argc, char **argv)
 
     active_tx_an = config.association_number;
     macsec_tx_sa_init(&tx_sa[active_tx_an], config.tx_key, config.tx_sci,
+                      config.tx_salt, config.tx_ssci,
                       config.association_number, config.initial_pn);
     macsec_rx_sa_init(&rx_sa[active_tx_an], config.rx_key, config.rx_sci,
+                      config.rx_salt, config.rx_ssci,
                       config.association_number, config.replay_window);
     rx_valid[active_tx_an] = true;
     pipeline.packet_pool = pool;
@@ -737,6 +789,8 @@ int main(int argc, char **argv)
     pipeline.rx_valid = rx_valid;
     pipeline.active_tx_an = &active_tx_an;
     pipeline.stats = &stats;
+    pipeline.plain_port = config.plain_port;
+    pipeline.secure_port = config.secure_port;
     memset(config.tx_key, 0, sizeof(config.tx_key));
     memset(config.rx_key, 0, sizeof(config.rx_key));
     signal(SIGINT, handle_signal);
@@ -744,14 +798,20 @@ int main(int argc, char **argv)
     signal(SIGUSR1, handle_signal);
     signal(SIGUSR2, handle_signal);
     worker_lcore = rte_get_next_lcore(rte_lcore_id(), 1, 0);
+    tx_lcore = worker_lcore >= RTE_MAX_LCORE
+                   ? RTE_MAX_LCORE
+                   : rte_get_next_lcore(worker_lcore, 1, 0);
     if (worker_lcore >= RTE_MAX_LCORE ||
-        rte_eal_remote_launch(crypto_stage, &pipeline, worker_lcore) != 0) {
-        fprintf(stderr, "a second enabled lcore is required for the crypto stage\n");
+        tx_lcore >= RTE_MAX_LCORE ||
+        rte_eal_remote_launch(crypto_stage, &pipeline, worker_lcore) != 0 ||
+        rte_eal_remote_launch(tx_stage, &pipeline, tx_lcore) != 0) {
+        fprintf(stderr, "three enabled lcores are required for RX, crypto and TX\n");
         goto cleanup_ports;
     }
     printf("plain port %" PRIu16 " <-> secure port %" PRIu16
-           "; IO lcore=%u crypto lcore=%u; press Ctrl-C to stop\n",
-           config.plain_port, config.secure_port, rte_lcore_id(), worker_lcore);
+           "; RX lcore=%u crypto lcore=%u TX lcore=%u; press Ctrl-C to stop\n",
+           config.plain_port, config.secure_port, rte_lcore_id(), worker_lcore,
+           tx_lcore);
     next_stats = rte_get_timer_cycles() + rte_get_timer_hz();
     started_cycles = rte_get_timer_cycles();
 
@@ -764,8 +824,12 @@ int main(int argc, char **argv)
             char line[128];
             uint8_t new_tx_key[MACSEC_KEY_LEN] = {0};
             uint8_t new_rx_key[MACSEC_KEY_LEN] = {0};
+            uint8_t new_tx_salt[MACSEC_SALT_LEN] = {0};
+            uint8_t new_rx_salt[MACSEC_SALT_LEN] = {0};
             bool have_tx = false;
             bool have_rx = false;
+            bool have_tx_salt = false;
+            bool have_rx_salt = false;
 
             prepare_rekey = 0;
             file = config.rekey_file == NULL ? NULL : fopen(config.rekey_file, "r");
@@ -775,16 +839,22 @@ int main(int argc, char **argv)
                     have_tx = parse_hex(line + 7, new_tx_key, sizeof(new_tx_key));
                 } else if (strncmp(line, "RX_KEY=", 7) == 0) {
                     have_rx = parse_hex(line + 7, new_rx_key, sizeof(new_rx_key));
+                } else if (strncmp(line, "TX_SALT=", 8) == 0) {
+                    have_tx_salt = parse_hex(line + 8, new_tx_salt, sizeof(new_tx_salt));
+                } else if (strncmp(line, "RX_SALT=", 8) == 0) {
+                    have_rx_salt = parse_hex(line + 8, new_rx_salt, sizeof(new_rx_salt));
                 }
             }
             if (file != NULL) {
                 fclose(file);
             }
-            if (have_tx && have_rx) {
+            if (have_tx && have_rx && have_tx_salt && have_rx_salt) {
                 pending_an = (uint8_t)((active_tx_an + 1U) % MACSEC_AN_COUNT);
                 macsec_tx_sa_init(&tx_sa[pending_an], new_tx_key, config.tx_sci,
+                                  new_tx_salt, config.tx_ssci,
                                   pending_an, 1U);
                 macsec_rx_sa_init(&rx_sa[pending_an], new_rx_key, config.rx_sci,
+                                  new_rx_salt, config.rx_ssci,
                                   pending_an, config.replay_window);
                 rx_valid[pending_an] = true;
                 rekey_pending = true;
@@ -795,6 +865,8 @@ int main(int argc, char **argv)
             }
             memset(new_tx_key, 0, sizeof(new_tx_key));
             memset(new_rx_key, 0, sizeof(new_rx_key));
+            memset(new_tx_salt, 0, sizeof(new_tx_salt));
+            memset(new_rx_salt, 0, sizeof(new_rx_salt));
         }
         if (activate_rekey) {
             activate_rekey = 0;
@@ -808,7 +880,6 @@ int main(int argc, char **argv)
         received = receive_stage(config.plain_port, true, &pipeline);
         received = (uint16_t)(received +
                    receive_stage(config.secure_port, false, &pipeline));
-        transmit_stage(config.plain_port, config.secure_port, &pipeline);
         now = rte_get_timer_cycles();
         if (received != 0U) {
             had_input = true;
@@ -816,6 +887,7 @@ int main(int argc, char **argv)
         } else if (config.exit_on_idle_ms != 0U && had_input &&
                    rte_ring_empty(pipeline.crypto_ring) &&
                    rte_ring_empty(pipeline.tx_ring) && !pipeline.worker_busy &&
+                   !pipeline.tx_busy &&
                    now - last_input_cycles >=
                        (rte_get_timer_hz() * config.exit_on_idle_ms) / 1000U) {
             force_quit = 1;
@@ -828,6 +900,7 @@ int main(int argc, char **argv)
     print_stats(&stats);
     putchar('\n');
     rte_eal_wait_lcore(worker_lcore);
+    rte_eal_wait_lcore(tx_lcore);
     {
         uint64_t runtime_us =
             (rte_get_timer_cycles() - started_cycles) * UINT64_C(1000000) /

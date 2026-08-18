@@ -25,15 +25,17 @@ python3 /home/poc/generate-ecpri-pcap.py empty.pcap --count 0
 set +e
 timeout -s INT 3 \
   /home/poc/macsec-fronthaul/build/apps/dpdk/poc_macsec_dpdk \
-  --no-huge --no-pci --file-prefix=macsec-pcap -l 0-1 \
+  --no-huge --no-pci --file-prefix=macsec-pcap -l 0-2 \
   --vdev=crypto_aesni_gcm0 \
   --vdev=net_pcap0,rx_pcap=input.pcap,tx_pcap=plain-output.pcap \
   --vdev=net_pcap1,rx_pcap=input.pcap,tx_pcap=secure-output.pcap \
   -- \
-  --tx-key=000102030405060708090a0b0c0d0e0f \
-  --rx-key=101112131415161718191a1b1c1d1e1f \
+  --tx-key=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f \
+  --rx-key=202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f \
   --tx-sci=0200000000010001 \
-  --rx-sci=0200000000020001
+  --rx-sci=0200000000020001 \
+  --tx-salt=000102030405060708090a0b --rx-salt=101112131415161718191a1b \
+  --tx-ssci=1 --rx-ssci=2
 result=$?
 set -e
 if [[ $result -ne 0 && $result -ne 124 ]]; then
@@ -46,15 +48,17 @@ python3 /home/poc/inspect-macsec-pcap.py secure-output.pcap \
 set +e
 timeout -s INT 3 \
   /home/poc/macsec-fronthaul/build/apps/dpdk/poc_macsec_dpdk \
-  --no-huge --no-pci --file-prefix=macsec-pcap-rx -l 0-1 \
+  --no-huge --no-pci --file-prefix=macsec-pcap-rx -l 0-2 \
   --vdev=crypto_aesni_gcm0 \
   --vdev=net_pcap0,rx_pcap=empty.pcap,tx_pcap=recovered.pcap \
   --vdev=net_pcap1,rx_pcap=secure-output.pcap,tx_pcap=discard.pcap \
   -- \
-  --tx-key=101112131415161718191a1b1c1d1e1f \
-  --rx-key=000102030405060708090a0b0c0d0e0f \
+  --tx-key=202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f \
+  --rx-key=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f \
   --tx-sci=0200000000020001 \
-  --rx-sci=0200000000010001
+  --rx-sci=0200000000010001 \
+  --tx-salt=101112131415161718191a1b --rx-salt=000102030405060708090a0b \
+  --tx-ssci=2 --rx-ssci=1
 result=$?
 set -e
 if [[ $result -ne 0 && $result -ne 124 ]]; then

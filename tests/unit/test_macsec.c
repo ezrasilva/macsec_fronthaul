@@ -11,6 +11,9 @@ static const uint8_t key[MACSEC_KEY_LEN] = {
 static const uint8_t sci[MACSEC_SCI_LEN] = {
     0x02, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01
 };
+static const uint8_t salt[MACSEC_SALT_LEN] = {
+    0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x10, 0x32, 0x54, 0x76
+};
 static const uint8_t frame[] = {
     0x02, 0x00, 0x00, 0x00, 0x00, 0x02,
     0x02, 0x00, 0x00, 0x00, 0x00, 0x01,
@@ -20,12 +23,12 @@ static const uint8_t frame[] = {
     0xc0, 0x00, 0x02, 0x02, 0xde, 0xad, 0xbe, 0xef
 };
 
-static size_t protect_with_pn(uint32_t pn, uint8_t *secure)
+static size_t protect_with_pn(uint64_t pn, uint8_t *secure)
 {
     struct macsec_tx_sa tx;
     size_t secure_len = 0;
 
-    macsec_tx_sa_init(&tx, key, sci, 0, pn);
+    macsec_tx_sa_init(&tx, key, sci, salt, 0x11223344, 0, pn);
     assert(macsec_protect(&tx, frame, sizeof(frame), secure, 256, &secure_len) == MACSEC_OK);
     return secure_len;
 }
@@ -39,8 +42,8 @@ static void test_round_trip(void)
     size_t secure_len = 0;
     size_t plain_len = 0;
 
-    macsec_tx_sa_init(&tx, key, sci, 0, 1);
-    macsec_rx_sa_init(&rx, key, sci, 0, 64);
+    macsec_tx_sa_init(&tx, key, sci, salt, 0x11223344, 0, 1);
+    macsec_rx_sa_init(&rx, key, sci, salt, 0x11223344, 0, 64);
     assert(macsec_protect(&tx, frame, sizeof(frame), secure, sizeof(secure), &secure_len) == MACSEC_OK);
     assert(secure[12] == 0x88 && secure[13] == 0xe5);
     assert(macsec_unprotect(&rx, secure, secure_len, plain, sizeof(plain), &plain_len) == MACSEC_OK);
@@ -59,7 +62,7 @@ static void test_integrity_failure_does_not_consume_pn(void)
 
     memcpy(corrupted, secure, secure_len);
     corrupted[30] ^= 0x80;
-    macsec_rx_sa_init(&rx, key, sci, 0, 64);
+    macsec_rx_sa_init(&rx, key, sci, salt, 0x11223344, 0, 64);
     assert(macsec_unprotect(&rx, corrupted, secure_len, plain, sizeof(plain), &plain_len) == MACSEC_ERR_AUTH);
     assert(macsec_unprotect(&rx, secure, secure_len, plain, sizeof(plain), &plain_len) == MACSEC_OK);
 }
@@ -74,7 +77,7 @@ static void test_replay_and_out_of_order(void)
     size_t len12 = protect_with_pn(12, packet12);
     size_t plain_len = 0;
 
-    macsec_rx_sa_init(&rx, key, sci, 0, 4);
+    macsec_rx_sa_init(&rx, key, sci, salt, 0x11223344, 0, 4);
     assert(macsec_unprotect(&rx, packet10, len10, plain, sizeof(plain), &plain_len) == MACSEC_OK);
     assert(macsec_unprotect(&rx, packet12, len12, plain, sizeof(plain), &plain_len) == MACSEC_OK);
     assert(macsec_unprotect(&rx, packet11, len11, plain, sizeof(plain), &plain_len) == MACSEC_OK);
@@ -91,13 +94,36 @@ static void test_old_packet_and_pn_exhaustion(void)
     size_t secure_len = 0;
     size_t plain_len = 0;
 
-    macsec_rx_sa_init(&rx, key, sci, 0, 4);
+    macsec_rx_sa_init(&rx, key, sci, salt, 0x11223344, 0, 4);
     assert(macsec_unprotect(&rx, packet5, len5, plain, sizeof(plain), &plain_len) == MACSEC_OK);
     assert(macsec_unprotect(&rx, packet1, len1, plain, sizeof(plain), &plain_len) == MACSEC_ERR_REPLAY);
 
-    macsec_tx_sa_init(&tx, key, sci, 0, UINT32_MAX);
+    macsec_tx_sa_init(&tx, key, sci, salt, 0x11223344, 0, UINT64_MAX);
     assert(macsec_protect(&tx, frame, sizeof(frame), secure, sizeof(secure), &secure_len) == MACSEC_OK);
     assert(macsec_protect(&tx, frame, sizeof(frame), secure, sizeof(secure), &secure_len) == MACSEC_ERR_PN_EXHAUSTED);
+}
+
+static void test_xpn_low_word_rollover(void)
+{
+    struct macsec_tx_sa tx;
+    struct macsec_rx_sa rx;
+    uint8_t before[256], after[256], plain[256];
+    size_t before_len = 0, after_len = 0, plain_len = 0;
+
+    macsec_tx_sa_init(&tx, key, sci, salt, 0x11223344, 0, UINT32_MAX);
+    macsec_rx_sa_init(&rx, key, sci, salt, 0x11223344, 0, 64);
+    assert(macsec_protect(&tx, frame, sizeof(frame), before, sizeof(before),
+                          &before_len) == MACSEC_OK);
+    assert(macsec_protect(&tx, frame, sizeof(frame), after, sizeof(after),
+                          &after_len) == MACSEC_OK);
+    assert(before[16] == 0xff && before[17] == 0xff &&
+           before[18] == 0xff && before[19] == 0xff);
+    assert(after[16] == 0 && after[17] == 0 && after[18] == 0 && after[19] == 0);
+    assert(macsec_unprotect(&rx, before, before_len, plain, sizeof(plain),
+                            &plain_len) == MACSEC_OK);
+    assert(macsec_unprotect(&rx, after, after_len, plain, sizeof(plain),
+                            &plain_len) == MACSEC_OK);
+    assert(rx.highest_pn == UINT64_C(0x100000000));
 }
 
 int main(void)
@@ -106,7 +132,7 @@ int main(void)
     test_integrity_failure_does_not_consume_pn();
     test_replay_and_out_of_order();
     test_old_packet_and_pn_exhaustion();
+    test_xpn_low_word_rollover();
     puts("all MACsec unit tests passed");
     return 0;
 }
-

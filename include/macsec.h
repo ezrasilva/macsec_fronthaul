@@ -5,7 +5,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define MACSEC_KEY_LEN 16U
+#define MACSEC_KEY_LEN 32U
+#define MACSEC_SALT_LEN 12U
 #define MACSEC_SCI_LEN 8U
 #define MACSEC_ICV_LEN 16U
 #define MACSEC_MAX_REPLAY_WINDOW 64U
@@ -32,14 +33,18 @@ void macsec_set_aead_backend(macsec_aead_backend_fn backend, void *context);
 struct macsec_tx_sa {
     uint8_t key[MACSEC_KEY_LEN];
     uint8_t sci[MACSEC_SCI_LEN];
-    uint32_t next_pn;
+    uint8_t salt[MACSEC_SALT_LEN];
+    uint64_t next_pn;
+    uint32_t ssci;
     uint8_t association_number;
 };
 
 struct macsec_rx_sa {
     uint8_t key[MACSEC_KEY_LEN];
     uint8_t sci[MACSEC_SCI_LEN];
-    uint32_t highest_pn;
+    uint8_t salt[MACSEC_SALT_LEN];
+    uint64_t highest_pn;
+    uint32_t ssci;
     uint64_t replay_bitmap;
     uint8_t association_number;
     uint8_t replay_window;
@@ -48,12 +53,14 @@ struct macsec_rx_sa {
 void macsec_tx_sa_init(struct macsec_tx_sa *sa,
                        const uint8_t key[MACSEC_KEY_LEN],
                        const uint8_t sci[MACSEC_SCI_LEN],
+                       const uint8_t salt[MACSEC_SALT_LEN], uint32_t ssci,
                        uint8_t association_number,
-                       uint32_t initial_pn);
+                       uint64_t initial_pn);
 
 void macsec_rx_sa_init(struct macsec_rx_sa *sa,
                        const uint8_t key[MACSEC_KEY_LEN],
                        const uint8_t sci[MACSEC_SCI_LEN],
+                       const uint8_t salt[MACSEC_SALT_LEN], uint32_t ssci,
                        uint8_t association_number,
                        uint8_t replay_window);
 
