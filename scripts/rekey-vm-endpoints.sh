@@ -6,7 +6,7 @@ key="$project_dir/vm/.ssh/id_ed25519"
 known_hosts="$project_dir/vm/.ssh/known_hosts"
 ssh_options=(-F /dev/null -i "$key" -o "UserKnownHostsFile=$known_hosts")
 keyctl=/home/poc/macsec-fronthaul/build-openssl36/src/keying/poc_keyctl
-control_socket=/tmp/macsec-poc-control.sock
+control_socket=/run/macsec-pqc/control.sock
 grace_seconds=${MACSEC_RETIRE_GRACE_SECONDS:-2}
 
 status() {

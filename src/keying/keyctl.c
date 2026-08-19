@@ -1,6 +1,9 @@
 #define _POSIX_C_SOURCE 200809L
 
+#include "key_control.h"
+
 #include <errno.h>
+#include <openssl/crypto.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,6 +14,8 @@
 int main(int argc, char **argv)
 {
     struct sockaddr_un address = {0};
+    struct key_control_command parsed;
+    struct key_control_wire_message wire;
     char command[512];
     char response[80];
     size_t used = 0;
@@ -34,19 +39,31 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
     command[used] = '\0';
+    if (!key_control_parse(command, &parsed) ||
+        !key_control_encode(&parsed, &wire)) {
+        fprintf(stderr, "invalid control command\n");
+        OPENSSL_cleanse(command, sizeof(command));
+        key_control_clear(&parsed);
+        return EXIT_FAILURE;
+    }
+    OPENSSL_cleanse(command, sizeof(command));
+    key_control_clear(&parsed);
     descriptor = socket(AF_UNIX, SOCK_SEQPACKET, 0);
     if (descriptor < 0) {
         perror("control socket");
+        key_control_wire_clear(&wire);
         return EXIT_FAILURE;
     }
     address.sun_family = AF_UNIX;
     memcpy(address.sun_path, argv[1], strlen(argv[1]) + 1U);
     if (connect(descriptor, (const struct sockaddr *)&address, sizeof(address)) != 0 ||
-        send(descriptor, command, used, MSG_NOSIGNAL) != (ssize_t)used) {
+        send(descriptor, &wire, sizeof(wire), MSG_NOSIGNAL) != (ssize_t)sizeof(wire)) {
         perror("send control command");
+        key_control_wire_clear(&wire);
         close(descriptor);
         return EXIT_FAILURE;
     }
+    key_control_wire_clear(&wire);
     count = recv(descriptor, response, sizeof(response) - 1U, 0);
     close(descriptor);
     if (count <= 0) {

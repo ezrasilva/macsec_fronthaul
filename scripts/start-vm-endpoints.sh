@@ -16,6 +16,7 @@ start_endpoint() {
 
   ssh "${ssh_options[@]}" "poc@$host" \
     "sudo systemctl stop macsec-poc.service 2>/dev/null || true
+     sudo install -d -o poc -g poc -m 0700 /run/macsec-pqc
      sudo systemd-run --unit=macsec-poc --property=Type=simple \\
        /home/poc/macsec-fronthaul/build/apps/dpdk/poc_macsec_dpdk \\
        --no-huge --no-pci -l 0-2 \\
@@ -24,15 +25,15 @@ start_endpoint() {
        --vdev=net_af_packet0,iface=fh0 -- \\
        --tx-sci=$tx_sci --rx-sci=$rx_sci \\
        --tx-ssci=$tx_ssci --rx-ssci=$rx_ssci \\
-       --control-socket=/tmp/macsec-poc-control.sock --control-uid=\$(id -u poc)
+       --control-socket=/run/macsec-pqc/control.sock --control-uid=\$(id -u poc)
      for attempt in \$(seq 1 30); do
        ip link show tap_plain >/dev/null 2>&1 && \\
-         test -S /tmp/macsec-poc-control.sock && break
+         test -S /run/macsec-pqc/control.sock && break
        sleep 0.2
      done
      sudo ip addr replace $address/24 dev tap_plain
      sudo ip link set tap_plain up
-     test -S /tmp/macsec-poc-control.sock"
+     test -S /run/macsec-pqc/control.sock"
 }
 
 du_sci=0200000000010001

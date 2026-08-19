@@ -1,5 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
+#include "key_control.h"
+
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -148,34 +150,31 @@ static void write_hex(FILE *file, const uint8_t *data, size_t length)
     }
 }
 
-static char *append_hex(char *output, const uint8_t *data, size_t length)
-{
-    static const char digits[] = "0123456789abcdef";
-    size_t i;
-    for (i = 0; i < length; i++) {
-        *output++ = digits[data[i] >> 4];
-        *output++ = digits[data[i] & 0x0fU];
-    }
-    return output;
-}
-
-static bool control_send(const char *path, const char *message, size_t length)
+static bool control_send(const char *path,
+                         const struct key_control_command *command)
 {
     struct sockaddr_un address = {0};
+    struct key_control_wire_message wire;
     char response[16];
     ssize_t received;
     int descriptor;
 
-    if (strlen(path) >= sizeof(address.sun_path)) return false;
+    if (strlen(path) >= sizeof(address.sun_path) ||
+        !key_control_encode(command, &wire)) return false;
     descriptor = socket(AF_UNIX, SOCK_SEQPACKET, 0);
-    if (descriptor < 0) return false;
+    if (descriptor < 0) {
+        key_control_wire_clear(&wire);
+        return false;
+    }
     address.sun_family = AF_UNIX;
     memcpy(address.sun_path, path, strlen(path) + 1U);
     if (connect(descriptor, (const struct sockaddr *)&address, sizeof(address)) != 0 ||
-        send(descriptor, message, length, MSG_NOSIGNAL) != (ssize_t)length) {
+        send(descriptor, &wire, sizeof(wire), MSG_NOSIGNAL) != (ssize_t)sizeof(wire)) {
+        key_control_wire_clear(&wire);
         close(descriptor);
         return false;
     }
+    key_control_wire_clear(&wire);
     received = recv(descriptor, response, sizeof(response), 0);
     close(descriptor);
     return received == 3 && memcmp(response, "OK\n", 3U) == 0;
@@ -215,29 +214,26 @@ static bool install_over_control(const char *output_path,
 {
     const char *socket_path;
     const uint8_t *tx_key, *rx_key, *tx_salt, *rx_salt;
+    struct key_control_command command = {0};
     bool du;
     uint8_t an;
-    char message[320];
-    char *cursor;
-    int prefix;
 
     if (!control_parameters(output_path, &socket_path, &du, &an)) return false;
     tx_key = du ? du_to_ru : ru_to_du;
     rx_key = du ? ru_to_du : du_to_ru;
     tx_salt = du ? du_salt : ru_salt;
     rx_salt = du ? ru_salt : du_salt;
-    prefix = snprintf(message, sizeof(message), "INSTALL AN=%u TX_KEY=", an);
-    if (prefix < 0 || (size_t)prefix >= sizeof(message)) return false;
-    cursor = message + prefix;
-    cursor = append_hex(cursor, tx_key, SAK_LEN);
-    memcpy(cursor, " RX_KEY=", 8U); cursor += 8U;
-    cursor = append_hex(cursor, rx_key, SAK_LEN);
-    memcpy(cursor, " TX_SALT=", 9U); cursor += 9U;
-    cursor = append_hex(cursor, tx_salt, 12U);
-    memcpy(cursor, " RX_SALT=", 9U); cursor += 9U;
-    cursor = append_hex(cursor, rx_salt, 12U);
-    *cursor++ = '\n';
-    return control_send(socket_path, message, (size_t)(cursor - message));
+    command.operation = KEY_CONTROL_INSTALL;
+    command.association_number = an;
+    memcpy(command.tx_key, tx_key, sizeof(command.tx_key));
+    memcpy(command.rx_key, rx_key, sizeof(command.rx_key));
+    memcpy(command.tx_salt, tx_salt, sizeof(command.tx_salt));
+    memcpy(command.rx_salt, rx_salt, sizeof(command.rx_salt));
+    {
+        bool success = control_send(socket_path, &command);
+        key_control_clear(&command);
+        return success;
+    }
 }
 
 static bool activate_control(const char *output_path)
@@ -245,14 +241,18 @@ static bool activate_control(const char *output_path)
     const char *socket_path;
     bool du;
     uint8_t an;
-    char message[32];
-    int length;
+    struct key_control_command command = {0};
 
     if (strncmp(output_path, "unix:", 5U) != 0) return true;
     if (!control_parameters(output_path, &socket_path, &du, &an)) return false;
     (void)du;
-    length = snprintf(message, sizeof(message), "ACTIVATE AN=%u\n", an);
-    return length > 0 && control_send(socket_path, message, (size_t)length);
+    command.operation = KEY_CONTROL_ACTIVATE;
+    command.association_number = an;
+    {
+        bool success = control_send(socket_path, &command);
+        key_control_clear(&command);
+        return success;
+    }
 }
 
 static bool make_confirmation(const char *role,

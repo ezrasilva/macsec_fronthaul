@@ -7,7 +7,7 @@ known_hosts="$project_dir/vm/.ssh/known_hosts"
 ssh_options=(-F /dev/null -i "$key" -o "UserKnownHostsFile=$known_hosts")
 binary=/home/poc/macsec-fronthaul/build-openssl36/src/keying/poc_tls_keying
 pki=/home/poc/macsec-pki36
-control_socket=/tmp/macsec-poc-control.sock
+control_socket=/run/macsec-pqc/control.sock
 control_an=${1:-0}
 if [[ ! "$control_an" =~ ^[0-3]$ ]]; then
   echo "AN inválido: $control_an" >&2

@@ -14,12 +14,13 @@ key_control_dep = declare_dependency(
 executable(
   'poc_tls_keying',
   'tls_keying.c',
-  dependencies: openssl,
+  dependencies: [openssl, key_control_dep],
   install: false,
 )
 
 executable(
   'poc_keyctl',
   'keyctl.c',
+  dependencies: key_control_dep,
   install: false,
 )

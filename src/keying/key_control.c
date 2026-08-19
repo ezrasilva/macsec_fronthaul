@@ -5,6 +5,23 @@
 #include <stdlib.h>
 #include <string.h>
 
+_Static_assert(sizeof(struct key_control_wire_message) == KEY_CONTROL_WIRE_SIZE,
+               "unexpected key-control wire padding");
+
+static void store_be32(uint8_t output[4], uint32_t value)
+{
+    output[0] = (uint8_t)(value >> 24);
+    output[1] = (uint8_t)(value >> 16);
+    output[2] = (uint8_t)(value >> 8);
+    output[3] = (uint8_t)value;
+}
+
+static uint32_t load_be32(const uint8_t input[4])
+{
+    return ((uint32_t)input[0] << 24) | ((uint32_t)input[1] << 16) |
+           ((uint32_t)input[2] << 8) | input[3];
+}
+
 static int hex_nibble(char value)
 {
     if (value >= '0' && value <= '9') return value - '0';
@@ -111,7 +128,71 @@ invalid:
     return true;
 }
 
+bool key_control_encode(const struct key_control_command *command,
+                        struct key_control_wire_message *wire)
+{
+    uint32_t payload_length;
+
+    if (command == NULL || wire == NULL ||
+        command->operation < KEY_CONTROL_INSTALL ||
+        command->operation > KEY_CONTROL_STATUS ||
+        (command->operation != KEY_CONTROL_STATUS &&
+         command->association_number > 3U)) return false;
+    memset(wire, 0, sizeof(*wire));
+    wire->version = KEY_CONTROL_VERSION;
+    wire->operation = (uint8_t)command->operation;
+    wire->association_number = command->association_number;
+    payload_length = command->operation == KEY_CONTROL_INSTALL
+                         ? KEY_CONTROL_INSTALL_PAYLOAD_SIZE
+                         : 0U;
+    store_be32(wire->payload_length_be, payload_length);
+    if (command->operation == KEY_CONTROL_INSTALL) {
+        memcpy(wire->tx_key, command->tx_key, sizeof(wire->tx_key));
+        memcpy(wire->rx_key, command->rx_key, sizeof(wire->rx_key));
+        memcpy(wire->tx_salt, command->tx_salt, sizeof(wire->tx_salt));
+        memcpy(wire->rx_salt, command->rx_salt, sizeof(wire->rx_salt));
+    }
+    return true;
+}
+
+bool key_control_decode(const struct key_control_wire_message *wire,
+                        size_t wire_length, struct key_control_command *command)
+{
+    uint32_t payload_length;
+    uint8_t zero_payload[KEY_CONTROL_INSTALL_PAYLOAD_SIZE] = {0};
+
+    if (wire == NULL || command == NULL || wire_length != sizeof(*wire) ||
+        wire->version != KEY_CONTROL_VERSION || wire->reserved != 0U ||
+        wire->operation < KEY_CONTROL_INSTALL ||
+        wire->operation > KEY_CONTROL_STATUS) return false;
+    payload_length = load_be32(wire->payload_length_be);
+    if ((wire->operation == KEY_CONTROL_INSTALL &&
+         payload_length != KEY_CONTROL_INSTALL_PAYLOAD_SIZE) ||
+        (wire->operation != KEY_CONTROL_INSTALL && payload_length != 0U) ||
+        (wire->operation != KEY_CONTROL_STATUS && wire->association_number > 3U) ||
+        (wire->operation == KEY_CONTROL_STATUS && wire->association_number != 0U) ||
+        (wire->operation != KEY_CONTROL_INSTALL &&
+         memcmp(wire->tx_key, zero_payload, sizeof(zero_payload)) != 0)) {
+        return false;
+    }
+    memset(command, 0, sizeof(*command));
+    command->operation = (enum key_control_operation)wire->operation;
+    command->association_number = wire->association_number;
+    if (command->operation == KEY_CONTROL_INSTALL) {
+        memcpy(command->tx_key, wire->tx_key, sizeof(command->tx_key));
+        memcpy(command->rx_key, wire->rx_key, sizeof(command->rx_key));
+        memcpy(command->tx_salt, wire->tx_salt, sizeof(command->tx_salt));
+        memcpy(command->rx_salt, wire->rx_salt, sizeof(command->rx_salt));
+    }
+    return true;
+}
+
 void key_control_clear(struct key_control_command *command)
 {
     if (command != NULL) OPENSSL_cleanse(command, sizeof(*command));
+}
+
+void key_control_wire_clear(struct key_control_wire_message *wire)
+{
+    if (wire != NULL) OPENSSL_cleanse(wire, sizeof(*wire));
 }

@@ -90,6 +90,7 @@ struct app_config {
     bool have_control_uid;
     uint32_t exit_on_idle_ms;
     bool latency_stats;
+    bool legacy_keying;
 };
 
 struct app_stats {
@@ -202,6 +203,7 @@ static void usage(const char *program)
     fprintf(stderr,
             "Usage: %s [EAL options] -- --tx-sci HEX16 --rx-sci HEX16 [options]\n"
             "       Provide initial keys or --control-socket PATH.\n"
+            "  --enable-legacy-keying  allow key argv, rekey file and signals\n"
             "  --plain-port N       unprotected Ethernet port (default 0)\n"
             "  --secure-port N      protected Ethernet port (default 1)\n"
             "  --an N               association number, 0..3 (default 0)\n"
@@ -237,6 +239,7 @@ static bool parse_app_args(int argc, char **argv, struct app_config *config)
         {"rx-ssci", required_argument, NULL, 'C'},
         {"exit-on-idle-ms", required_argument, NULL, 'x'},
         {"latency-stats", no_argument, NULL, 'L'},
+        {"enable-legacy-keying", no_argument, NULL, 'g'},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0}
     };
@@ -341,13 +344,20 @@ static bool parse_app_args(int argc, char **argv, struct app_config *config)
         case 'L':
             config->latency_stats = true;
             break;
+        case 'g':
+            config->legacy_keying = true;
+            break;
         case 'h':
         default:
             usage(argv[0]);
             return false;
         }
     }
-    if (!config->have_tx_sci || !config->have_rx_sci ||
+    if ((!config->legacy_keying &&
+         (config->have_tx_key || config->have_rx_key ||
+          config->have_tx_salt || config->have_rx_salt ||
+          config->rekey_file != NULL)) ||
+        !config->have_tx_sci || !config->have_rx_sci ||
         !config->have_tx_ssci || !config->have_rx_ssci ||
         config->plain_port == config->secure_port ||
         ((config->have_tx_key || config->have_rx_key ||
@@ -357,6 +367,12 @@ static bool parse_app_args(int argc, char **argv, struct app_config *config)
         ((!config->have_tx_key || !config->have_rx_key ||
           !config->have_tx_salt || !config->have_rx_salt) &&
          config->control_socket == NULL)) {
+        if (!config->legacy_keying &&
+            (config->have_tx_key || config->have_rx_key ||
+             config->have_tx_salt || config->have_rx_salt ||
+             config->rekey_file != NULL)) {
+            fprintf(stderr, "legacy key arguments require --enable-legacy-keying\n");
+        }
         usage(argv[0]);
         return false;
     }
@@ -406,7 +422,7 @@ static int control_socket_open(const char *path, uid_t owner)
 static int control_receive(int listener, struct key_control_command *command,
                            int *client, uid_t allowed_uid)
 {
-    char message[512];
+    struct key_control_wire_message wire;
     struct ucred credentials;
     socklen_t credentials_len = sizeof(credentials);
     ssize_t length;
@@ -422,21 +438,18 @@ static int control_receive(int listener, struct key_control_command *command,
             return 0;
         }
     }
-    length = recv(*client, message, sizeof(message) - 1U, 0);
+    memset(&wire, 0, sizeof(wire));
+    length = recv(*client, &wire, sizeof(wire), MSG_TRUNC);
     if (length < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
-    if (length <= 0 || (size_t)length == sizeof(message) - 1U) {
+    if (length != (ssize_t)sizeof(wire) ||
+        !key_control_decode(&wire, (size_t)(length > 0 ? length : 0), command)) {
         (void)send(*client, "INVALID\n", 8U, MSG_NOSIGNAL);
+        key_control_wire_clear(&wire);
         close(*client);
         *client = -1;
         return 0;
     }
-    message[length] = '\0';
-    if (!key_control_parse(message, command)) {
-        (void)send(*client, "INVALID\n", 8U, MSG_NOSIGNAL);
-        close(*client);
-        *client = -1;
-        return 0;
-    }
+    key_control_wire_clear(&wire);
     return 1;
 }
 
@@ -1164,8 +1177,10 @@ int main(int argc, char **argv)
     memset(config.rx_key, 0, sizeof(config.rx_key));
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
-    signal(SIGUSR1, handle_signal);
-    signal(SIGUSR2, handle_signal);
+    if (config.legacy_keying) {
+        signal(SIGUSR1, handle_signal);
+        signal(SIGUSR2, handle_signal);
+    }
     worker_lcore = rte_get_next_lcore(rte_lcore_id(), 1, 0);
     tx_lcore = worker_lcore >= RTE_MAX_LCORE
                    ? RTE_MAX_LCORE

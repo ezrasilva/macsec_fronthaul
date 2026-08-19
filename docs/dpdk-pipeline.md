@@ -34,6 +34,7 @@ sudo ./build/apps/dpdk/poc_macsec_dpdk \
   --vdev=net_tap0,iface=tap_plain \
   --vdev=net_tap1,iface=tap_secure \
   -- \
+  --enable-legacy-keying \
   --tx-key=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f \
   --rx-key=202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f \
   --tx-sci=0200000000010001 \
@@ -80,6 +81,7 @@ filas sem criar interfaces do kernel:
 ./build/apps/dpdk/poc_macsec_dpdk \
   --no-huge -l 0-2 --vdev=crypto_aesni_gcm0 \
   --vdev=net_ring0 --vdev=net_ring1 -- \
+  --enable-legacy-keying \
   --tx-key=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f \
   --rx-key=202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f \
   --tx-sci=0200000000010001 \
@@ -114,26 +116,30 @@ sentidos do enlace.
 
 ## Controle de SAs
 
-Com `--control-socket /run/macsec-poc/control.sock`, o dataplane cria um Unix
-socket `SOCK_SEQPACKET` com modo `0600` e aceita somente processos com o mesmo
-UID efetivo. Os comandos são enviados pelo `stdin`, evitando chaves em `argv`:
+Com `--control-socket /run/macsec-pqc/control.sock`, o dataplane cria um Unix
+socket `SOCK_SEQPACKET` com modo `0600`, transfere sua propriedade para o UID
+configurado e valida cada conexão com `SO_PEERCRED`. O diretório do socket deve
+ser criado com modo `0700`. Os comandos entram pelo `stdin` do `poc_keyctl`,
+evitando chaves em `argv`:
 
 ```sh
 printf '%s\n' 'INSTALL AN=1 TX_KEY=... RX_KEY=... TX_SALT=... RX_SALT=...' |
-  ./build/src/keying/poc_keyctl /run/macsec-poc/control.sock
+  ./build/src/keying/poc_keyctl /run/macsec-pqc/control.sock
 printf '%s\n' 'ACTIVATE AN=1' |
-  ./build/src/keying/poc_keyctl /run/macsec-poc/control.sock
+  ./build/src/keying/poc_keyctl /run/macsec-pqc/control.sock
 printf '%s\n' 'RETIRE AN=0' |
-  ./build/src/keying/poc_keyctl /run/macsec-poc/control.sock
+  ./build/src/keying/poc_keyctl /run/macsec-pqc/control.sock
 printf '%s\n' 'STATUS' |
-  ./build/src/keying/poc_keyctl /run/macsec-poc/control.sock
+  ./build/src/keying/poc_keyctl /run/macsec-pqc/control.sock
 ```
 
 `INSTALL` só escreve em AN inativo e publica a RX SA depois da inicialização
 completa. `ACTIVATE` exige que o AN tenha sido instalado. `RETIRE` rejeita o AN
 TX ativo, interrompe sua publicação RX, aguarda o crypto lcore e limpa a SA da
-memória. O mecanismo antigo por sinais permanece temporariamente disponível
-para compatibilidade com os ensaios existentes.
+memória. No socket, o `poc_keyctl` converte essa interface textual em mensagens
+binárias versionadas de tamanho fixo; chaves e salts não passam por parsing de
+texto no dataplane. O mecanismo antigo por sinais e argumentos só é habilitado
+explicitamente com `--enable-legacy-keying`.
 
 Quando inicia com `--control-socket`, mas sem chaves e salts, o dataplane fica
 em `WAITING_FOR_SA`: ele não retira frames da porta plain antes da ativação da

@@ -30,6 +30,7 @@ timeout -s INT 3 \
   --vdev=net_pcap0,rx_pcap=input.pcap,tx_pcap=plain-output.pcap \
   --vdev=net_pcap1,rx_pcap=input.pcap,tx_pcap=secure-output.pcap \
   -- \
+  --enable-legacy-keying \
   --tx-key=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f \
   --rx-key=202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f \
   --tx-sci=0200000000010001 \
@@ -53,6 +54,7 @@ timeout -s INT 3 \
   --vdev=net_pcap0,rx_pcap=empty.pcap,tx_pcap=recovered.pcap \
   --vdev=net_pcap1,rx_pcap=secure-output.pcap,tx_pcap=discard.pcap \
   -- \
+  --enable-legacy-keying \
   --tx-key=202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f \
   --rx-key=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f \
   --tx-sci=0200000000020001 \
