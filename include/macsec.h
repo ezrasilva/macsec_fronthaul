@@ -11,6 +11,7 @@
 #define MACSEC_ICV_LEN 16U
 #define MACSEC_MAX_REPLAY_WINDOW 64U
 #define MACSEC_ETHERTYPE 0x88E5U
+#define MACSEC_FRAME_OVERHEAD 32U
 
 enum macsec_status {
     MACSEC_OK = 0,
@@ -50,6 +51,19 @@ struct macsec_rx_sa {
     uint8_t replay_window;
 };
 
+struct macsec_crypto_request {
+    bool encrypt;
+    const uint8_t *key;
+    uint8_t nonce[12];
+    const uint8_t *aad;
+    size_t aad_len;
+    const uint8_t *input;
+    size_t input_len;
+    uint8_t *output;
+    uint8_t *tag;
+    uint64_t packet_number;
+};
+
 void macsec_tx_sa_init(struct macsec_tx_sa *sa,
                        const uint8_t key[MACSEC_KEY_LEN],
                        const uint8_t sci[MACSEC_SCI_LEN],
@@ -77,6 +91,40 @@ enum macsec_status macsec_unprotect(struct macsec_rx_sa *sa,
                                     uint8_t *plain_frame,
                                     size_t plain_capacity,
                                     size_t *plain_len);
+
+enum macsec_status macsec_prepare_protect(
+    struct macsec_tx_sa *sa, const uint8_t *plain_frame, size_t plain_len,
+    uint8_t *secure_frame, size_t secure_capacity, size_t *secure_len,
+    struct macsec_crypto_request *request);
+
+enum macsec_status macsec_prepare_unprotect(
+    struct macsec_rx_sa *sa, const uint8_t *secure_frame, size_t secure_len,
+    uint8_t *plain_frame, size_t plain_capacity, size_t *plain_len,
+    struct macsec_crypto_request *request);
+
+enum macsec_status macsec_complete_unprotect(
+    struct macsec_rx_sa *sa, const struct macsec_crypto_request *request,
+    enum macsec_status crypto_status);
+
+enum macsec_status macsec_prepare_protect_in_place(
+    struct macsec_tx_sa *sa, uint8_t *frame, size_t plain_len,
+    size_t frame_capacity, size_t *secure_len,
+    struct macsec_crypto_request *request);
+
+/* Prepares a layout where DA/SA are at frame[0..11] and the original
+ * EtherType/payload has already been positioned at frame[28]. */
+enum macsec_status macsec_prepare_protect_direct(
+    struct macsec_tx_sa *sa, uint8_t *frame, size_t plain_len,
+    size_t frame_capacity, size_t *secure_len,
+    struct macsec_crypto_request *request);
+
+enum macsec_status macsec_prepare_unprotect_in_place(
+    struct macsec_rx_sa *sa, uint8_t *frame, size_t secure_len,
+    size_t *plain_len, struct macsec_crypto_request *request);
+
+enum macsec_status macsec_finish_unprotect_in_place(
+    struct macsec_rx_sa *sa, const struct macsec_crypto_request *request,
+    enum macsec_status crypto_status, uint8_t *frame);
 
 const char *macsec_status_string(enum macsec_status status);
 

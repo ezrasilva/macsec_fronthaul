@@ -47,15 +47,18 @@ output=$(timeout 120 \
   --rx-sci=0200000000020001 \
   --tx-salt=000102030405060708090a0b --rx-salt=101112131415161718191a1b \
   --tx-ssci=1 --rx-ssci=2 \
+  --latency-stats \
   --exit-on-idle-ms=100)
 printf '%s\n' "$output"
 summary=$(tr '\r' '\n' <<<"$output" | grep 'protected=' | tail -1)
 runtime=$(grep -o 'runtime_us=[0-9]* processed=[0-9]* pps=[0-9.]*' <<<"$output" | tail -1)
+latency=$(grep 'latency_us_avg=' <<<"$output" | tail -1)
 grep -q "protected=$count " <<<"$summary"
 grep -q 'auth=0 replay=0 format=0 other=0 alloc_drop=0 tx_drop=0 ring_drop=0' <<<"$summary"
 python3 /home/poc/inspect-macsec-pcap.py secure-output.pcap \
   --sci=0200000000010001 --expected="$count"
-echo "LOAD_RESULT frames=$count $runtime"
+test -n "$latency"
+echo "LOAD_RESULT frames=$count $runtime $latency"
 sha256sum input.pcap secure-output.pcap
 REMOTE
 

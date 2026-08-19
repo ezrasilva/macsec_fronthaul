@@ -12,6 +12,15 @@ O processamento AES-GCM usa `rte_cryptodev` com o PMD virtual
 `crypto_aesni_gcm`. A biblioteca mantém
 OpenSSL como backend de referência para os testes unitários, enquanto o
 dataplane registra o backend DPDK após inicializar a fila e as sessões AEAD.
+O IV e o AAD ficam na área privada pré-alocada de `rte_crypto_op`, sem
+`rte_malloc` por pacote. O crypto lcore retira até 32 jobs por vez, prepara os
+nonces XPN e submete as operações juntas por `rte_cryptodev_enqueue_burst`.
+O PMD cifra ou autentica diretamente o mbuf recebido; não existe mbuf
+criptográfico ou buffer de frame intermediário. Também não há `memmove`: na
+proteção, `adj(12)`, `prepend(28)` e `append(16)` reposicionam os metadados do
+mbuf e deixam o EtherType/payload original após o SecTAG. Na recuperação,
+`trim(16)` e `adj(16)` restauram o layout Ethernet. O PMD informa suporte a
+in-place SGL, mas segmentação não é necessária e adicionaria descritores.
 
 ## Execução
 
@@ -86,6 +95,11 @@ O processo informa frames protegidos e recuperados, falhas de autenticação,
 replay, formato, alocação e transmissão. `Ctrl-C` encerra as portas e imprime os
 valores finais.
 
+Com `--latency-stats`, cada job recebe timestamp na entrada do `crypto_ring` e
+é observado na saída para TX. O relatório inclui média, p50, p95, p99, máximo e
+jitter médio em microssegundos. A instrumentação é opcional para não afetar os
+ensaios de throughput puro.
+
 ## Duas pontas
 
 Os argumentos são direcionais. Na ponta O-RU, os valores devem ser invertidos:
@@ -97,3 +111,42 @@ O-DU RX key/SCI = O-RU TX key/SCI
 
 Isso cria duas Secure Channels independentes e evita reutilizar nonce entre os
 sentidos do enlace.
+
+## Controle de SAs
+
+Com `--control-socket /run/macsec-poc/control.sock`, o dataplane cria um Unix
+socket `SOCK_SEQPACKET` com modo `0600` e aceita somente processos com o mesmo
+UID efetivo. Os comandos são enviados pelo `stdin`, evitando chaves em `argv`:
+
+```sh
+printf '%s\n' 'INSTALL AN=1 TX_KEY=... RX_KEY=... TX_SALT=... RX_SALT=...' |
+  ./build/src/keying/poc_keyctl /run/macsec-poc/control.sock
+printf '%s\n' 'ACTIVATE AN=1' |
+  ./build/src/keying/poc_keyctl /run/macsec-poc/control.sock
+printf '%s\n' 'RETIRE AN=0' |
+  ./build/src/keying/poc_keyctl /run/macsec-poc/control.sock
+printf '%s\n' 'STATUS' |
+  ./build/src/keying/poc_keyctl /run/macsec-poc/control.sock
+```
+
+`INSTALL` só escreve em AN inativo e publica a RX SA depois da inicialização
+completa. `ACTIVATE` exige que o AN tenha sido instalado. `RETIRE` rejeita o AN
+TX ativo, interrompe sua publicação RX, aguarda o crypto lcore e limpa a SA da
+memória. O mecanismo antigo por sinais permanece temporariamente disponível
+para compatibilidade com os ensaios existentes.
+
+Quando inicia com `--control-socket`, mas sem chaves e salts, o dataplane fica
+em `WAITING_FOR_SA`: ele não retira frames da porta plain antes da ativação da
+primeira SA. `--control-uid UID` permite entregar o socket a um keying agent
+com UID diferente e restringe `SO_PEERCRED` exatamente a esse usuário.
+
+O `poc_tls_keying` aceita `unix:/caminho/do/socket` no lugar do arquivo de
+saída. `MACSEC_ENDPOINT_ROLE=du|ru` seleciona as direções e
+`MACSEC_CONTROL_AN=0..3` seleciona o AN. O agente envia `INSTALL` após derivar
+as chaves, realiza a confirmação mútua por HMAC no canal TLS e somente então
+envia `ACTIVATE`; nenhum arquivo contendo SAK ou salt é criado.
+
+`rekey-vm-endpoints.sh` consulta `STATUS` nas duas pontas, exige que os ANs
+ativos coincidam, escolhe `(AN + 1) mod 4`, negocia e ativa a nova SA e, após
+`MACSEC_RETIRE_GRACE_SECONDS` (dois segundos por padrão), envia `RETIRE` para o
+AN anterior nos dois endpoints.

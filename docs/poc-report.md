@@ -9,7 +9,8 @@
 - Pipeline concorrente com lcore de IO, lcore de criptografia e filas
   `rte_ring`.
 - TLS 1.3 híbrido `X25519MLKEM768`, autenticação mútua `ML-DSA-65`, EKM e
-  HKDF para duas chaves MACsec direcionais.
+  HKDF para duas chaves MACsec direcionais, com confirmação mútua do material
+  derivado por HMAC-SHA256.
 - Rekey em duas fases, mantendo a SA anterior durante a transição.
 - Replay PCAP de frames eCPRI IQ Data.
 
@@ -28,13 +29,26 @@
 
 ## Ensaio de carga PCAP
 
-O pipeline XPN-256 processou 100.000 frames eCPRI em 147.206 µs, correspondendo
-a aproximadamente 679.320 pacotes/s. Não ocorreram erros de autenticação,
+O pipeline XPN-256 instrumentado, com cryptodev em burst e transformação
+in-place e reposicionamento por headroom, processou 100.000 frames eCPRI em
+137.810 µs, correspondendo a aproximadamente 725.637 pacotes/s. Não ocorreram
+erros de autenticação,
 formato, replay, alocação, transmissão ou saturação de `rte_ring`. A captura
 MACsec resultante contém todos os frames com PN final 100.000.
 
+A latência interna entre entrada no `crypto_ring` e consumo pelo estágio TX foi
+de 86,35 µs em média, p50 de 7 µs, p95 de 510 µs, p99 de 666 µs e máximo de
+782 µs. O jitter médio entre amostras consecutivas foi 0,44 µs. A distribuição
+bimodal reflete o processamento em bursts e o buffering do PMD PCAP. A medição
+inclui o custo da instrumentação e o buffering do PMD PCAP; não representa RTT
+nem latência física de enlace.
+
 O valor mede este pipeline sintético com PMD PCAP em duas vCPUs e não deve ser
 interpretado como capacidade do fronthaul físico.
+
+O benchmark emite `latency_us_avg`, `p50`, `p95`, `p99`, `max`, `jitter_avg` e
+número de amostras. Para throughput sem interferência de timestamps, execute
+uma rodada separada sem `--latency-stats`.
 
 ## Benchmark TLS
 

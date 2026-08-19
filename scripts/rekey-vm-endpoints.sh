@@ -5,34 +5,38 @@ project_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 key="$project_dir/vm/.ssh/id_ed25519"
 known_hosts="$project_dir/vm/.ssh/known_hosts"
 ssh_options=(-F /dev/null -i "$key" -o "UserKnownHostsFile=$known_hosts")
+keyctl=/home/poc/macsec-fronthaul/build-openssl36/src/keying/poc_keyctl
+control_socket=/tmp/macsec-poc-control.sock
+grace_seconds=${MACSEC_RETIRE_GRACE_SECONDS:-2}
 
-"$project_dir/scripts/negotiate-vm-keys.sh"
-
-read_key() {
-  ssh "${ssh_options[@]}" poc@192.168.122.101 \
-    "sed -n 's/^$1=//p' /home/poc/macsec-keys.env"
+status() {
+  ssh "${ssh_options[@]}" "poc@$1" \
+    "printf 'STATUS\\n' | $keyctl $control_socket"
 }
 
-du_key=$(read_key DU_TO_RU_KEY)
-ru_key=$(read_key RU_TO_DU_KEY)
-du_salt=$(read_key DU_TO_RU_SALT)
-ru_salt=$(read_key RU_TO_DU_SALT)
-if [[ ! "$du_key" =~ ^[[:xdigit:]]{64}$ || ! "$ru_key" =~ ^[[:xdigit:]]{64}$ ]]; then
-  echo "Erro: material de rekey inválido" >&2
-  exit 1
-fi
-if [[ ! "$du_salt" =~ ^[[:xdigit:]]{24}$ || ! "$ru_salt" =~ ^[[:xdigit:]]{24}$ ]]; then
-  echo "Erro: salt XPN inválido" >&2
+du_status=$(status 192.168.122.101)
+ru_status=$(status 192.168.122.102)
+du_active=$(sed -n 's/.*ACTIVE=\([0-3]\).*/\1/p' <<<"$du_status")
+ru_active=$(sed -n 's/.*ACTIVE=\([0-3]\).*/\1/p' <<<"$ru_status")
+
+if [[ "$du_status" != *"READY=1"* || "$ru_status" != *"READY=1"* ||
+      -z "$du_active" || "$du_active" != "$ru_active" ]]; then
+  echo "Estado inconsistente: DU='$du_status' RU='$ru_status'" >&2
   exit 1
 fi
 
+next_an=$(( (du_active + 1) % 4 ))
+"$project_dir/scripts/negotiate-vm-keys.sh" "$next_an"
+
+sleep "$grace_seconds"
+retire_command="RETIRE AN=$du_active"
 ssh "${ssh_options[@]}" poc@192.168.122.101 \
-  "printf 'TX_KEY=%s\nRX_KEY=%s\nTX_SALT=%s\nRX_SALT=%s\n' '$du_key' '$ru_key' '$du_salt' '$ru_salt' > /home/poc/macsec-rekey.env; chmod 600 /home/poc/macsec-rekey.env; sudo systemctl kill -s SIGUSR1 macsec-poc.service"
+  "printf '%s\\n' '$retire_command' | $keyctl $control_socket" &
+du_pid=$!
 ssh "${ssh_options[@]}" poc@192.168.122.102 \
-  "printf 'TX_KEY=%s\nRX_KEY=%s\nTX_SALT=%s\nRX_SALT=%s\n' '$ru_key' '$du_key' '$ru_salt' '$du_salt' > /home/poc/macsec-rekey.env; chmod 600 /home/poc/macsec-rekey.env; sudo systemctl kill -s SIGUSR1 macsec-poc.service"
+  "printf '%s\\n' '$retire_command' | $keyctl $control_socket" &
+ru_pid=$!
+wait "$du_pid"
+wait "$ru_pid"
 
-sleep 1
-ssh "${ssh_options[@]}" poc@192.168.122.101 "sudo systemctl kill -s SIGUSR2 macsec-poc.service"
-ssh "${ssh_options[@]}" poc@192.168.122.102 "sudo systemctl kill -s SIGUSR2 macsec-poc.service"
-
-echo "Rekey preparado e ativado nos dois endpoints"
+echo "Rekey AN=$du_active→$next_an concluído; AN antigo retirado após ${grace_seconds}s"

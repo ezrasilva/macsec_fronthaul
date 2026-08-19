@@ -1,0 +1,54 @@
+#include "key_control.h"
+
+#include <assert.h>
+#include <stdio.h>
+#include <string.h>
+
+static void test_install(void)
+{
+    struct key_control_command command;
+    const char *message =
+        "INSTALL AN=2 "
+        "TX_KEY=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f "
+        "RX_KEY=202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f "
+        "TX_SALT=000102030405060708090a0b "
+        "RX_SALT=101112131415161718191a1b\n";
+
+    assert(key_control_parse(message, &command));
+    assert(command.operation == KEY_CONTROL_INSTALL);
+    assert(command.association_number == 2U);
+    assert(command.tx_key[0] == 0U && command.tx_key[31] == 0x1fU);
+    assert(command.rx_salt[0] == 0x10U && command.rx_salt[11] == 0x1bU);
+    key_control_clear(&command);
+}
+
+static void test_state_commands(void)
+{
+    struct key_control_command command;
+    assert(key_control_parse("STATUS\n", &command));
+    assert(command.operation == KEY_CONTROL_STATUS);
+    assert(key_control_parse("ACTIVATE AN=3\n", &command));
+    assert(command.operation == KEY_CONTROL_ACTIVATE && command.association_number == 3U);
+    assert(key_control_parse("RETIRE AN=1", &command));
+    assert(command.operation == KEY_CONTROL_RETIRE && command.association_number == 1U);
+}
+
+static void test_rejections(void)
+{
+    struct key_control_command command;
+    assert(!key_control_parse("ACTIVATE AN=4", &command));
+    assert(!key_control_parse("ACTIVATE AN=1 TX_KEY=00", &command));
+    assert(!key_control_parse("INSTALL AN=1", &command));
+    assert(!key_control_parse("RETIRE AN=1 AN=2", &command));
+    assert(!key_control_parse("ACTIVATE AN=x AN=1", &command));
+    assert(!key_control_parse("UNKNOWN AN=1", &command));
+}
+
+int main(void)
+{
+    test_install();
+    test_state_commands();
+    test_rejections();
+    puts("all key-control unit tests passed");
+    return 0;
+}

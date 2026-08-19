@@ -12,9 +12,12 @@ OpenRAN@Brasil.
 - AES-GCM no dataplane pelo `rte_cryptodev` e PMD `crypto_aesni_gcm`;
 - pipeline concorrente com lcore de IO, lcore de criptografia e filas
   `rte_ring` SPSC;
+- submissão AES-GCM em bursts de até 32 operações diretamente nos `rte_mbuf`;
+- inserção e retirada do SecTAG por headroom/tailroom, sem copiar o payload;
 - TLS 1.3 com troca híbrida `X25519MLKEM768`;
 - autenticação mútua com certificados `ML-DSA-65`;
 - EKM + HKDF-SHA256 para gerar chaves MACsec direcionais;
+- confirmação mútua por HMAC das SAKs e salts derivados;
 - rekey em duas fases, preservando a SA anterior durante a transição;
 - testes por ping, PCAP eCPRI e carga sintética.
 
@@ -75,6 +78,11 @@ sudo ./scripts/vm-status.sh
 
 O OpenSSL 3.6 usado para ML-KEM/ML-DSA fica isolado em `/opt/openssl` dentro
 das VMs. Os certificados de laboratório ficam em `/home/poc/macsec-pki36`.
+Para exigir um tipo específico de chave do certificado remoto, defina
+`MACSEC_TLS_PEER_KEY` (por exemplo, `ML-DSA-65`); divergências encerram o
+handshake antes da exportação das chaves.
+Quando o endereço de conexão difere da identidade do certificado, use
+`MACSEC_TLS_SERVER_NAME`; a verificação de nome permanece obrigatória.
 
 ## Execução ponta a ponta
 
@@ -84,8 +92,9 @@ das VMs. Os certificados de laboratório ficam em `/home/poc/macsec-pki36`.
 ./scripts/stop-vm-endpoints.sh
 ```
 
-O primeiro comando negocia as chaves PQC, verifica se os dois pares derivaram
-o mesmo material e inicia os endpoints DPDK. O teste confirma o ping e captura
+O primeiro comando negocia as chaves PQC e executa confirmação mútua por HMAC,
+vinculada às duas SAKs e aos dois salts derivados, antes de iniciar os endpoints
+DPDK. O teste confirma o ping e captura
 frames com EtherType MACsec `0x88e5`.
 
 ## Rekey sem interrupção
@@ -96,8 +105,12 @@ frames com EtherType MACsec `0x88e5`.
 
 O rekey possui duas fases:
 
-1. `SIGUSR1` prepara a nova SA nos dois pares;
-2. `SIGUSR2` ativa a transmissão somente após ambos estarem prontos.
+1. o agente TLS envia `INSTALL` pelo Unix socket nos dois pares;
+2. após a confirmação mútua por HMAC, envia `ACTIVATE` para o novo AN.
+
+O dataplane inicia em `WAITING_FOR_SA` e não processa tráfego plain até a
+primeira ativação. SAKs e salts não passam por `argv` nem por arquivos
+temporários no fluxo padrão das VMs.
 
 O teste executa a troca durante 100 pings e exige 0% de perda.
 

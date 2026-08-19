@@ -24,6 +24,9 @@ DA (6) | SA (6) | 88-E5 (2) | TCI/AN (1) | SL (1) | PN (4) | SCI (8)
 | ciphertext (EtherType original + payload) | ICV (16)
 ```
 
+Com SCI explícito e ICV de 16 bytes, o frame protegido cresce 32 bytes. A
+checagem de capacidade e o tailroom do mbuf usam esse valor integral.
+
 O AAD é todo o cabeçalho, de `DA` até o final do `SCI`. O SecTAG transporta os
 32 bits inferiores do PN. O receptor reconstrói o PN de 64 bits e o nonce é
 `(SSCI || PN64) XOR salt`, conforme o perfil XPN. Frames menores que 48 bytes usam
@@ -34,6 +37,11 @@ o campo SL; para os demais, SL é zero.
 O PN nunca pode ser reutilizado com a mesma SAK/salt/SSCI. A transição do word
 inferior `0xffffffff → 0x00000000` mantém a SA ativa e incrementa a parte alta.
 Somente após `0xffffffffffffffff` a SA se esgota. A recepção só atualiza a janela
-GCM bem-sucedida.
+após autenticação GCM bem-sucedida.
+
+Na reconstrução do XPN, pacotes fora de ordem podem pertencer ao bloco de 32
+bits imediatamente anterior ou seguinte ao PN esperado. A parte alta é ajustada
+nas duas direções antes da autenticação, permitindo reordenação legítima ao
+redor de `0xffffffff → 0x00000000` sem ampliar a janela anti-replay.
 
 Esta camada não implementa MKA nem interoperabilidade certificada IEEE 802.1AE.

@@ -8,7 +8,7 @@
 #define MAC_ADDRESSES_LEN 12U
 #define SECTAG_WITH_SCI_LEN 16U
 #define SECURE_HEADER_LEN (MAC_ADDRESSES_LEN + SECTAG_WITH_SCI_LEN)
-#define MACSEC_OVERHEAD (SECTAG_WITH_SCI_LEN - 2U + MACSEC_ICV_LEN)
+#define MACSEC_OVERHEAD (SECTAG_WITH_SCI_LEN + MACSEC_ICV_LEN)
 
 #define TCI_SC 0x20U
 #define TCI_E 0x08U
@@ -70,10 +70,18 @@ static void make_xpn_nonce(uint8_t nonce[12], uint32_t ssci, uint64_t pn,
 static uint64_t recover_xpn(const struct macsec_rx_sa *sa, uint32_t low)
 {
     uint64_t expected = sa->highest_pn == 0U ? 1U : sa->highest_pn + 1U;
-    uint64_t recovered = (expected & UINT64_C(0xffffffff00000000)) | low;
+    uint64_t upper = expected & UINT64_C(0xffffffff00000000);
+    uint64_t recovered = upper | low;
     uint32_t expected_low = (uint32_t)expected;
+
     if (low < expected_low && ((low ^ expected_low) & UINT32_C(0x80000000)) != 0U) {
-        recovered += UINT64_C(0x100000000);
+        if (upper != UINT64_C(0xffffffff00000000)) {
+            recovered += UINT64_C(0x100000000);
+        }
+    } else if (low > expected_low &&
+               ((low ^ expected_low) & UINT32_C(0x80000000)) != 0U &&
+               upper != 0U) {
+        recovered -= UINT64_C(0x100000000);
     }
     return recovered;
 }
@@ -212,6 +220,209 @@ void macsec_rx_sa_init(struct macsec_rx_sa *sa,
     sa->replay_window = replay_window == 0U || replay_window > MACSEC_MAX_REPLAY_WINDOW
                             ? MACSEC_MAX_REPLAY_WINDOW
                             : replay_window;
+}
+
+enum macsec_status macsec_prepare_protect(
+    struct macsec_tx_sa *sa, const uint8_t *plain_frame, size_t plain_len,
+    uint8_t *secure_frame, size_t secure_capacity, size_t *secure_len,
+    struct macsec_crypto_request *request)
+{
+    size_t protected_len;
+    uint64_t pn;
+
+    if (sa == NULL || plain_frame == NULL || secure_frame == NULL ||
+        secure_len == NULL || request == NULL || plain_len < ETHERNET_HEADER_LEN) {
+        return MACSEC_ERR_ARGUMENT;
+    }
+    if (sa->next_pn == 0U) return MACSEC_ERR_PN_EXHAUSTED;
+    if (plain_len > SIZE_MAX - MACSEC_OVERHEAD ||
+        secure_capacity < plain_len + MACSEC_OVERHEAD) {
+        return MACSEC_ERR_CAPACITY;
+    }
+    protected_len = plain_len - MAC_ADDRESSES_LEN;
+    pn = sa->next_pn;
+    memcpy(secure_frame, plain_frame, MAC_ADDRESSES_LEN);
+    store_be16(secure_frame + 12, MACSEC_ETHERTYPE);
+    secure_frame[14] = (uint8_t)(TCI_PROFILE | sa->association_number);
+    secure_frame[15] = protected_len < 48U ? (uint8_t)protected_len : 0U;
+    store_be32(secure_frame + 16, (uint32_t)pn);
+    memcpy(secure_frame + 20, sa->sci, MACSEC_SCI_LEN);
+
+    memset(request, 0, sizeof(*request));
+    request->encrypt = true;
+    request->key = sa->key;
+    make_xpn_nonce(request->nonce, sa->ssci, pn, sa->salt);
+    request->aad = secure_frame;
+    request->aad_len = SECURE_HEADER_LEN;
+    request->input = plain_frame + MAC_ADDRESSES_LEN;
+    request->input_len = protected_len;
+    request->output = secure_frame + SECURE_HEADER_LEN;
+    request->tag = request->output + protected_len;
+    request->packet_number = pn;
+    *secure_len = SECURE_HEADER_LEN + protected_len + MACSEC_ICV_LEN;
+
+    /* Reserving a PN before asynchronous submission prevents nonce reuse if
+     * an operation fails after other requests have already been queued. */
+    sa->next_pn = pn == UINT64_MAX ? 0U : pn + 1U;
+    return MACSEC_OK;
+}
+
+enum macsec_status macsec_prepare_unprotect(
+    struct macsec_rx_sa *sa, const uint8_t *secure_frame, size_t secure_len,
+    uint8_t *plain_frame, size_t plain_capacity, size_t *plain_len,
+    struct macsec_crypto_request *request)
+{
+    size_t protected_len;
+    size_t result_len;
+    uint8_t tci;
+    uint8_t short_length;
+    uint64_t pn;
+
+    if (sa == NULL || secure_frame == NULL || plain_frame == NULL ||
+        plain_len == NULL || request == NULL) return MACSEC_ERR_ARGUMENT;
+    if (secure_len < SECURE_HEADER_LEN + 2U + MACSEC_ICV_LEN ||
+        load_be16(secure_frame + 12) != MACSEC_ETHERTYPE) return MACSEC_ERR_FORMAT;
+    tci = secure_frame[14];
+    if ((tci & (TCI_SC | TCI_E | TCI_C)) != TCI_PROFILE ||
+        (tci & TCI_AN_MASK) != sa->association_number ||
+        memcmp(secure_frame + 20, sa->sci, MACSEC_SCI_LEN) != 0) {
+        return MACSEC_ERR_FORMAT;
+    }
+    protected_len = secure_len - SECURE_HEADER_LEN - MACSEC_ICV_LEN;
+    short_length = secure_frame[15];
+    if ((protected_len < 48U && short_length != protected_len) ||
+        (protected_len >= 48U && short_length != 0U)) return MACSEC_ERR_FORMAT;
+    result_len = MAC_ADDRESSES_LEN + protected_len;
+    if (plain_capacity < result_len) return MACSEC_ERR_CAPACITY;
+    pn = recover_xpn(sa, load_be32(secure_frame + 16));
+    if (replay_rejected(sa, pn)) return MACSEC_ERR_REPLAY;
+
+    memcpy(plain_frame, secure_frame, MAC_ADDRESSES_LEN);
+    memset(request, 0, sizeof(*request));
+    request->encrypt = false;
+    request->key = sa->key;
+    make_xpn_nonce(request->nonce, sa->ssci, pn, sa->salt);
+    request->aad = secure_frame;
+    request->aad_len = SECURE_HEADER_LEN;
+    request->input = secure_frame + SECURE_HEADER_LEN;
+    request->input_len = protected_len;
+    request->output = plain_frame + MAC_ADDRESSES_LEN;
+    request->tag = (uint8_t *)(secure_frame + SECURE_HEADER_LEN + protected_len);
+    request->packet_number = pn;
+    *plain_len = result_len;
+    return MACSEC_OK;
+}
+
+enum macsec_status macsec_complete_unprotect(
+    struct macsec_rx_sa *sa, const struct macsec_crypto_request *request,
+    enum macsec_status crypto_status)
+{
+    if (sa == NULL || request == NULL || request->encrypt) return MACSEC_ERR_ARGUMENT;
+    if (crypto_status != MACSEC_OK) return crypto_status;
+    if (replay_rejected(sa, request->packet_number)) return MACSEC_ERR_REPLAY;
+    replay_accept(sa, request->packet_number);
+    return MACSEC_OK;
+}
+
+enum macsec_status macsec_prepare_protect_direct(
+    struct macsec_tx_sa *sa, uint8_t *frame, size_t plain_len,
+    size_t frame_capacity, size_t *secure_len,
+    struct macsec_crypto_request *request)
+{
+    size_t protected_len;
+    uint64_t pn;
+
+    if (sa == NULL || frame == NULL || secure_len == NULL || request == NULL ||
+        plain_len < ETHERNET_HEADER_LEN) return MACSEC_ERR_ARGUMENT;
+    if (sa->next_pn == 0U) return MACSEC_ERR_PN_EXHAUSTED;
+    if (plain_len > SIZE_MAX - MACSEC_OVERHEAD ||
+        frame_capacity < plain_len + MACSEC_OVERHEAD) return MACSEC_ERR_CAPACITY;
+    protected_len = plain_len - MAC_ADDRESSES_LEN;
+    pn = sa->next_pn;
+    store_be16(frame + 12, MACSEC_ETHERTYPE);
+    frame[14] = (uint8_t)(TCI_PROFILE | sa->association_number);
+    frame[15] = protected_len < 48U ? (uint8_t)protected_len : 0U;
+    store_be32(frame + 16, (uint32_t)pn);
+    memcpy(frame + 20, sa->sci, MACSEC_SCI_LEN);
+    memset(request, 0, sizeof(*request));
+    request->encrypt = true;
+    request->key = sa->key;
+    make_xpn_nonce(request->nonce, sa->ssci, pn, sa->salt);
+    request->aad = frame;
+    request->aad_len = SECURE_HEADER_LEN;
+    request->input = frame + SECURE_HEADER_LEN;
+    request->input_len = protected_len;
+    request->output = frame + SECURE_HEADER_LEN;
+    request->tag = request->output + protected_len;
+    request->packet_number = pn;
+    *secure_len = plain_len + MACSEC_OVERHEAD;
+    sa->next_pn = pn == UINT64_MAX ? 0U : pn + 1U;
+    return MACSEC_OK;
+}
+
+enum macsec_status macsec_prepare_protect_in_place(
+    struct macsec_tx_sa *sa, uint8_t *frame, size_t plain_len,
+    size_t frame_capacity, size_t *secure_len,
+    struct macsec_crypto_request *request)
+{
+    if (sa == NULL || frame == NULL || secure_len == NULL || request == NULL ||
+        plain_len < ETHERNET_HEADER_LEN) return MACSEC_ERR_ARGUMENT;
+    if (plain_len > SIZE_MAX - MACSEC_OVERHEAD ||
+        frame_capacity < plain_len + MACSEC_OVERHEAD) return MACSEC_ERR_CAPACITY;
+    memmove(frame + SECURE_HEADER_LEN, frame + MAC_ADDRESSES_LEN,
+            plain_len - MAC_ADDRESSES_LEN);
+    return macsec_prepare_protect_direct(sa, frame, plain_len, frame_capacity,
+                                         secure_len, request);
+}
+
+enum macsec_status macsec_prepare_unprotect_in_place(
+    struct macsec_rx_sa *sa, uint8_t *frame, size_t secure_len,
+    size_t *plain_len, struct macsec_crypto_request *request)
+{
+    size_t protected_len;
+    uint8_t tci;
+    uint8_t short_length;
+    uint64_t pn;
+
+    if (sa == NULL || frame == NULL || plain_len == NULL || request == NULL)
+        return MACSEC_ERR_ARGUMENT;
+    if (secure_len < SECURE_HEADER_LEN + 2U + MACSEC_ICV_LEN ||
+        load_be16(frame + 12) != MACSEC_ETHERTYPE) return MACSEC_ERR_FORMAT;
+    tci = frame[14];
+    if ((tci & (TCI_SC | TCI_E | TCI_C)) != TCI_PROFILE ||
+        (tci & TCI_AN_MASK) != sa->association_number ||
+        memcmp(frame + 20, sa->sci, MACSEC_SCI_LEN) != 0) return MACSEC_ERR_FORMAT;
+    protected_len = secure_len - SECURE_HEADER_LEN - MACSEC_ICV_LEN;
+    short_length = frame[15];
+    if ((protected_len < 48U && short_length != protected_len) ||
+        (protected_len >= 48U && short_length != 0U)) return MACSEC_ERR_FORMAT;
+    pn = recover_xpn(sa, load_be32(frame + 16));
+    if (replay_rejected(sa, pn)) return MACSEC_ERR_REPLAY;
+    memset(request, 0, sizeof(*request));
+    request->encrypt = false;
+    request->key = sa->key;
+    make_xpn_nonce(request->nonce, sa->ssci, pn, sa->salt);
+    request->aad = frame;
+    request->aad_len = SECURE_HEADER_LEN;
+    request->input = frame + SECURE_HEADER_LEN;
+    request->input_len = protected_len;
+    request->output = frame + SECURE_HEADER_LEN;
+    request->tag = frame + SECURE_HEADER_LEN + protected_len;
+    request->packet_number = pn;
+    *plain_len = MAC_ADDRESSES_LEN + protected_len;
+    return MACSEC_OK;
+}
+
+enum macsec_status macsec_finish_unprotect_in_place(
+    struct macsec_rx_sa *sa, const struct macsec_crypto_request *request,
+    enum macsec_status crypto_status, uint8_t *frame)
+{
+    enum macsec_status status =
+        macsec_complete_unprotect(sa, request, crypto_status);
+    if (status != MACSEC_OK) return status;
+    memmove(frame + MAC_ADDRESSES_LEN, frame + SECURE_HEADER_LEN,
+            request->input_len);
+    return MACSEC_OK;
 }
 
 enum macsec_status macsec_protect(struct macsec_tx_sa *sa,
