@@ -43,6 +43,12 @@
 #define CRYPTO_INDEX_OFFSET (CRYPTO_AAD_OFFSET + 32U)
 #define CRYPTO_PRIVATE_SIZE (16U + 32U + 8U)
 #define LATENCY_BUCKETS 4097U
+#define VLAN_MAP_MAX 8U
+#define STATUS_VLAN_DROP ((enum macsec_status)100)
+#define AN_NONE 0xffU
+#define DEFAULT_MTU 1500U
+/* Black frame (sem FCS) = red frame + SecTAG + ICV = MTU + 14 + 4 (VLAN) + 32. */
+#define MACSEC_L2_VLAN_OVERHEAD 18U
 
 struct crypto_session_entry {
     uint8_t key[MACSEC_KEY_LEN];
@@ -60,6 +66,12 @@ struct crypto_backend {
     struct crypto_session_entry sessions[MACSEC_AN_COUNT * 2U];
     uint64_t session_clock;
     bool in_place_sgl;
+};
+
+struct vlan_map {
+    unsigned count;
+    uint16_t black[VLAN_MAP_MAX];
+    uint16_t red[VLAN_MAP_MAX];
 };
 
 struct app_config {
@@ -91,6 +103,9 @@ struct app_config {
     uint32_t exit_on_idle_ms;
     bool latency_stats;
     bool legacy_keying;
+    bool no_crypto;
+    uint32_t mtu;
+    struct vlan_map vlan;
 };
 
 struct app_stats {
@@ -104,6 +119,11 @@ struct app_stats {
     _Atomic uint64_t tx_drops;
     _Atomic uint64_t rekeys;
     _Atomic uint64_t ring_drops;
+    _Atomic uint64_t vlan_drops;
+    _Atomic uint64_t oversize_drops;
+    _Atomic uint64_t an_protected[MACSEC_AN_COUNT];
+    _Atomic uint64_t an_unprotected[MACSEC_AN_COUNT];
+    _Atomic uint64_t an_errors[MACSEC_AN_COUNT];
     _Atomic uint64_t latency_hist[LATENCY_BUCKETS];
     _Atomic uint64_t latency_total_us;
     _Atomic uint64_t latency_jitter_total_us;
@@ -115,6 +135,7 @@ struct packet_job {
     struct rte_mbuf *packet;
     bool protect;
     uint8_t tx_an;
+    uint8_t an;                 /* AN usada (AN_NONE se nao houve SecTAG) */
     uint64_t enqueued_cycles;
 };
 
@@ -136,6 +157,9 @@ struct pipeline_context {
     uint64_t previous_latency_us;
     uint16_t plain_port;
     uint16_t secure_port;
+    const struct vlan_map *vlan;
+    bool no_crypto;
+    size_t max_plain_frame;
 };
 
 static volatile sig_atomic_t force_quit;
@@ -214,8 +238,13 @@ static void usage(const char *program)
             "  --control-uid UID     owner/authorized UID for control socket\n"
             "  --tx-salt HEX24 --rx-salt HEX24 --tx-ssci N --rx-ssci N\n"
             "  --exit-on-idle-ms N  stop after PCAP input becomes idle\n"
-            "  --latency-stats      report p50/p95/p99 and jitter\n",
-            program);
+            "  --latency-stats      report p50/p95/p99 and jitter\n"
+            "  --vlan-map B:R       black VLAN B <-> red VLAN R (repeatable, max %u);\n"
+            "                       with a map, untagged/unknown-VID frames are dropped\n"
+            "  --mtu N              red-side MTU = max OFH payload (default %u);\n"
+            "                       black side uses N+32; frames above N+50 B are dropped\n"
+            "  --no-crypto          only swap VLANs (experiment E0); no keys needed\n",
+            program, VLAN_MAP_MAX, DEFAULT_MTU);
 }
 
 static bool parse_app_args(int argc, char **argv, struct app_config *config)
@@ -239,6 +268,9 @@ static bool parse_app_args(int argc, char **argv, struct app_config *config)
         {"rx-ssci", required_argument, NULL, 'C'},
         {"exit-on-idle-ms", required_argument, NULL, 'x'},
         {"latency-stats", no_argument, NULL, 'L'},
+        {"vlan-map", required_argument, NULL, 'V'},
+        {"mtu", required_argument, NULL, 'M'},
+        {"no-crypto", no_argument, NULL, 'N'},
         {"enable-legacy-keying", no_argument, NULL, 'g'},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0}
@@ -249,6 +281,7 @@ static bool parse_app_args(int argc, char **argv, struct app_config *config)
     config->secure_port = 1;
     config->initial_pn = 1;
     config->replay_window = MACSEC_MAX_REPLAY_WINDOW;
+    config->mtu = DEFAULT_MTU;
     optind = 1;
     while ((option = getopt_long(argc, argv, "", options, NULL)) != -1) {
         uint32_t value;
@@ -347,11 +380,49 @@ static bool parse_app_args(int argc, char **argv, struct app_config *config)
         case 'g':
             config->legacy_keying = true;
             break;
+        case 'V': {
+            char *colon = strchr(optarg, ':');
+            uint32_t black, red;
+            char black_text[8];
+
+            if (colon == NULL || (size_t)(colon - optarg) >= sizeof(black_text) ||
+                config->vlan.count >= VLAN_MAP_MAX) {
+                fprintf(stderr, "invalid --vlan-map (expected BLACK:RED)\n");
+                return false;
+            }
+            memcpy(black_text, optarg, (size_t)(colon - optarg));
+            black_text[colon - optarg] = '\0';
+            if (!parse_u32(black_text, 1, 4094, &black) ||
+                !parse_u32(colon + 1, 1, 4094, &red)) {
+                fprintf(stderr, "invalid --vlan-map: VIDs must be 1..4094\n");
+                return false;
+            }
+            config->vlan.black[config->vlan.count] = (uint16_t)black;
+            config->vlan.red[config->vlan.count] = (uint16_t)red;
+            config->vlan.count++;
+            break;
+        }
+        case 'M':
+            if (!parse_u32(optarg, 576, 9600, &config->mtu)) {
+                fprintf(stderr, "invalid --mtu (576..9600)\n");
+                return false;
+            }
+            break;
+        case 'N':
+            config->no_crypto = true;
+            break;
         case 'h':
         default:
             usage(argv[0]);
             return false;
         }
+    }
+    if (config->no_crypto) {
+        if (config->plain_port == config->secure_port) {
+            usage(argv[0]);
+            return false;
+        }
+        return true;
     }
     if ((!config->legacy_keying &&
          (config->have_tx_key || config->have_rx_key ||
@@ -693,7 +764,7 @@ static int initialize_crypto(struct crypto_backend *backend,
     return 0;
 }
 
-static int initialize_port(uint16_t port, struct rte_mempool *pool)
+static int initialize_port(uint16_t port, struct rte_mempool *pool, uint32_t mtu)
 {
     struct rte_eth_conf port_conf = {0};
     struct rte_eth_dev_info info;
@@ -710,6 +781,14 @@ static int initialize_port(uint16_t port, struct rte_mempool *pool)
         fprintf(stderr, "cannot query port %" PRIu16 ": %s\n", port, rte_strerror(-result));
         return -1;
     }
+    if (mtu > info.max_mtu) {
+        fprintf(stderr, "port %" PRIu16 ": MTU %u exceeds device maximum %u\n",
+                port, mtu, (unsigned)info.max_mtu);
+        return -1;
+    }
+    /* Sem offload de VLAN: a tag precisa chegar em linha, no quadro. */
+    port_conf.rxmode.mtu = (uint16_t)mtu;
+    port_conf.rxmode.offloads = 0;
     result = rte_eth_dev_configure(port, 1, 1, &port_conf);
     if (result != 0 || rte_eth_dev_adjust_nb_rx_tx_desc(port, &rx_desc, &tx_desc) != 0) {
         fprintf(stderr, "cannot configure port %" PRIu16 "\n", port);
@@ -745,6 +824,10 @@ static int initialize_port(uint16_t port, struct rte_mempool *pool)
 
 static void account_error(struct app_stats *stats, enum macsec_status status)
 {
+    if ((int)status == (int)STATUS_VLAN_DROP) {
+        stats->vlan_drops++;
+        return;
+    }
     switch (status) {
     case MACSEC_ERR_AUTH:
         stats->auth_errors++;
@@ -754,6 +837,9 @@ static void account_error(struct app_stats *stats, enum macsec_status status)
         break;
     case MACSEC_ERR_FORMAT:
         stats->format_errors++;
+        break;
+    case MACSEC_ERR_CAPACITY:
+        stats->oversize_drops++;
         break;
     default:
         stats->other_errors++;
@@ -791,6 +877,7 @@ static uint16_t receive_stage(uint16_t input_port, bool protect,
                          ? atomic_load_explicit(pipeline->active_tx_an,
                                                 memory_order_acquire)
                          : 0U;
+        job->an = protect ? job->tx_an : AN_NONE;
         job->enqueued_cycles = pipeline->latency_stats ? rte_get_timer_cycles() : 0U;
         if (rte_ring_enqueue(pipeline->crypto_ring, job) != 0) {
             rte_pktmbuf_free(job->packet);
@@ -801,6 +888,50 @@ static uint16_t receive_stage(uint16_t input_port, bool protect,
     return received;
 }
 
+static bool vlan_is_tag(const uint8_t *frame)
+{
+    return (frame[12] == 0x81 && frame[13] == 0x00) ||
+           (frame[12] == 0x88 && frame[13] == 0xa8);
+}
+
+/* Procura a VID do quadro no mapa. to_black: red->black; senao black->red.
+ * Sem mapa configurado, tudo passa sem alteracao. */
+static bool vlan_lookup(const uint8_t *frame, size_t len,
+                        const struct vlan_map *map, bool to_black,
+                        uint16_t *new_vid)
+{
+    unsigned i;
+    uint16_t vid;
+
+    if (map->count == 0U) {
+        *new_vid = 0;
+        return true;
+    }
+    if (len < 16U || !vlan_is_tag(frame)) return false;   /* DA SA TPID TCI */
+    vid = (uint16_t)((((uint16_t)frame[14] << 8) | frame[15]) & 0x0fffU);
+    for (i = 0; i < map->count; i++) {
+        if ((to_black ? map->red[i] : map->black[i]) == vid) {
+            *new_vid = to_black ? map->black[i] : map->red[i];
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Troca a VID mantendo PCP/DEI. A tag fica fora do ICV, entao nada a refazer. */
+static bool vlan_apply(uint8_t *frame, size_t len, const struct vlan_map *map,
+                       bool to_black)
+{
+    uint16_t new_vid;
+
+    if (!vlan_lookup(frame, len, map, to_black, &new_vid)) return false;
+    if (map->count != 0U) {
+        frame[14] = (uint8_t)((frame[14] & 0xf0U) | (new_vid >> 8));
+        frame[15] = (uint8_t)new_vid;
+    }
+    return true;
+}
+
 static void finish_crypto_job(struct pipeline_context *pipeline,
                               struct packet_job *job, size_t result_len,
                               enum macsec_status status)
@@ -808,6 +939,10 @@ static void finish_crypto_job(struct pipeline_context *pipeline,
     if (status != MACSEC_OK) {
         rte_pktmbuf_free(job->packet);
         account_error(pipeline->stats, status);
+        if (job->an < MACSEC_AN_COUNT && status != STATUS_VLAN_DROP &&
+            status != MACSEC_ERR_CAPACITY) {
+            pipeline->stats->an_errors[job->an]++;
+        }
         rte_mempool_put(pipeline->job_pool, job);
         return;
     }
@@ -821,6 +956,10 @@ static void finish_crypto_job(struct pipeline_context *pipeline,
     }
     if (job->protect) pipeline->stats->protected_ok++;
     else pipeline->stats->unprotected_ok++;
+    if (job->an < MACSEC_AN_COUNT) {
+        if (job->protect) pipeline->stats->an_protected[job->an]++;
+        else pipeline->stats->an_unprotected[job->an]++;
+    }
     while (!force_quit && rte_ring_enqueue(pipeline->tx_ring, job) != 0) rte_pause();
     if (force_quit) {
         rte_pktmbuf_free(job->packet);
@@ -862,7 +1001,28 @@ static int crypto_stage(void *argument)
             if (rte_pktmbuf_linearize(jobs[i]->packet) != 0) continue;
             frame = rte_pktmbuf_mtod(jobs[i]->packet, uint8_t *);
             frame_lens[i] = rte_pktmbuf_pkt_len(jobs[i]->packet);
+            if (pipeline->no_crypto) {
+                /* E0: so troca de VLAN (mesmo salto, sem custo de cifra). */
+                if (jobs[i]->protect && frame_lens[i] > pipeline->max_plain_frame) {
+                    statuses[i] = MACSEC_ERR_CAPACITY;
+                } else if (vlan_apply(frame, frame_lens[i], pipeline->vlan,
+                                      jobs[i]->protect)) {
+                    statuses[i] = MACSEC_OK;
+                    result_lens[i] = frame_lens[i];
+                } else {
+                    statuses[i] = STATUS_VLAN_DROP;
+                }
+                continue;
+            }
             if (jobs[i]->protect) {
+                if (frame_lens[i] > pipeline->max_plain_frame) {
+                    statuses[i] = MACSEC_ERR_CAPACITY;
+                    continue;
+                }
+                if (!vlan_apply(frame, frame_lens[i], pipeline->vlan, true)) {
+                    statuses[i] = STATUS_VLAN_DROP;
+                    continue;
+                }
                 /* DA SA [VLAN] ficam na frente; o SecTAG entra depois deles. */
                 uint8_t l2_bytes[MACSEC_MAX_L2_LEN];
                 size_t l2 = macsec_l2_header_len(frame, frame_lens[i]);
@@ -885,6 +1045,14 @@ static int crypto_stage(void *argument)
             } else if (macsec_peek_secure(frame, frame_lens[i], &an) &&
                        atomic_load_explicit(&pipeline->rx_valid[an],
                                             memory_order_acquire)) {
+                uint16_t unused_vid;
+
+                jobs[i]->an = an;
+                if (!vlan_lookup(frame, frame_lens[i], pipeline->vlan, false,
+                                 &unused_vid)) {
+                    statuses[i] = STATUS_VLAN_DROP;
+                    continue;
+                }
                 statuses[i] = macsec_prepare_unprotect_in_place(
                     &pipeline->rx_sa[an], frame, frame_lens[i], &result_lens[i],
                     request);
@@ -908,6 +1076,7 @@ static int crypto_stage(void *argument)
                     size_t l2 = requests[i].l2_len;
                     uint8_t *frame = rte_pktmbuf_mtod(request_packets[i], uint8_t *);
                     memcpy(l2_bytes, frame, l2);
+                    (void)vlan_apply(l2_bytes, l2, pipeline->vlan, false);
                     statuses[job_index] = macsec_complete_unprotect(
                         request_rx_sa[i], &requests[i], crypto_statuses[i]);
                     if (statuses[job_index] == MACSEC_OK) {
@@ -1062,11 +1231,29 @@ static void print_stats(const struct app_stats *stats)
     printf("\rprotected=%" PRIu64 " unprotected=%" PRIu64
            " auth=%" PRIu64 " replay=%" PRIu64 " format=%" PRIu64
            " other=%" PRIu64 " alloc_drop=%" PRIu64 " tx_drop=%" PRIu64
-           " ring_drop=%" PRIu64 " rekeys=%" PRIu64,
+           " ring_drop=%" PRIu64 " rekeys=%" PRIu64 " vlan_drop=%" PRIu64
+           " oversize=%" PRIu64,
            protected_ok, unprotected_ok, auth_errors, replay_errors,
            format_errors, other_errors, alloc_drops, tx_drops, ring_drops,
-           rekeys);
+           rekeys, atomic_load_explicit(&stats->vlan_drops, memory_order_relaxed),
+           atomic_load_explicit(&stats->oversize_drops, memory_order_relaxed));
     fflush(stdout);
+}
+
+static void print_sa_stats(const struct app_stats *stats)
+{
+    unsigned an;
+
+    for (an = 0; an < MACSEC_AN_COUNT; an++) {
+        uint64_t p = atomic_load_explicit(&stats->an_protected[an], memory_order_relaxed);
+        uint64_t u = atomic_load_explicit(&stats->an_unprotected[an], memory_order_relaxed);
+        uint64_t e = atomic_load_explicit(&stats->an_errors[an], memory_order_relaxed);
+
+        if (p != 0U || u != 0U || e != 0U) {
+            printf("sa an=%u protected=%" PRIu64 " unprotected=%" PRIu64
+                   " errors=%" PRIu64 "\n", an, p, u, e);
+        }
+    }
 }
 
 int main(int argc, char **argv)
@@ -1093,6 +1280,7 @@ int main(int argc, char **argv)
     int control_listener = -1;
     int control_client = -1;
     int exit_code = EXIT_FAILURE;
+    bool crypto_ready = false;
 
     eal_args = rte_eal_init(argc, argv);
     if (eal_args < 0) {
@@ -1117,19 +1305,31 @@ int main(int argc, char **argv)
         goto cleanup_eal;
     }
 
-    pool = rte_pktmbuf_pool_create("MACSEC_MBUF_POOL", NUM_MBUFS,
-                                   MBUF_CACHE_SIZE, 0,
-                                   RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
+    {
+        /* headroom + quadro black maximo (MTU + 50) + folga (af_packet pede ~MTU+450
+         * por quadro); nunca menos que o padrao */
+        uint32_t room = RTE_PKTMBUF_HEADROOM + config.mtu + MACSEC_FRAME_OVERHEAD +
+                        MACSEC_L2_VLAN_OVERHEAD + 512U;
+        if (room < RTE_MBUF_DEFAULT_BUF_SIZE) room = RTE_MBUF_DEFAULT_BUF_SIZE;
+        pool = rte_pktmbuf_pool_create("MACSEC_MBUF_POOL", NUM_MBUFS,
+                                       MBUF_CACHE_SIZE, 0, (uint16_t)room,
+                                       rte_socket_id());
+    }
     if (pool == NULL) {
         fprintf(stderr, "cannot create mbuf pool: %s\n", rte_strerror(rte_errno));
         goto cleanup_eal;
     }
-    if (initialize_crypto(&crypto, pool) != 0) {
-        fprintf(stderr, "cannot initialize rte_cryptodev AES-GCM backend\n");
-        goto cleanup_eal;
+    memset(&crypto, 0, sizeof(crypto));
+    if (!config.no_crypto) {
+        if (initialize_crypto(&crypto, pool) != 0) {
+            fprintf(stderr, "cannot initialize rte_cryptodev AES-GCM backend\n");
+            goto cleanup_eal;
+        }
+        crypto_ready = true;
     }
-    if (initialize_port(config.plain_port, pool) != 0 ||
-        initialize_port(config.secure_port, pool) != 0) {
+    if (initialize_port(config.plain_port, pool, config.mtu) != 0 ||
+        initialize_port(config.secure_port, pool,
+                        config.mtu + (config.no_crypto ? 0U : MACSEC_FRAME_OVERHEAD)) != 0) {
         goto cleanup_ports;
     }
     memset(&pipeline, 0, sizeof(pipeline));
@@ -1150,10 +1350,10 @@ int main(int argc, char **argv)
         atomic_init(&rx_valid[i], false);
     }
     atomic_init(&active_tx_an, config.association_number);
-    atomic_init(&tx_ready, false);
+    atomic_init(&tx_ready, config.no_crypto);
     atomic_init(&pipeline.worker_busy, false);
     atomic_init(&pipeline.tx_busy, false);
-    if (config.have_tx_key && config.have_rx_key &&
+    if (!config.no_crypto && config.have_tx_key && config.have_rx_key &&
         config.have_tx_salt && config.have_rx_salt) {
         macsec_tx_sa_init(&tx_sa[config.association_number], config.tx_key,
                           config.tx_sci, config.tx_salt, config.tx_ssci,
@@ -1176,6 +1376,9 @@ int main(int argc, char **argv)
     pipeline.plain_port = config.plain_port;
     pipeline.secure_port = config.secure_port;
     pipeline.latency_stats = config.latency_stats;
+    pipeline.vlan = &config.vlan;
+    pipeline.no_crypto = config.no_crypto;
+    pipeline.max_plain_frame = (size_t)config.mtu + MACSEC_L2_VLAN_OVERHEAD;
     memset(config.tx_key, 0, sizeof(config.tx_key));
     memset(config.rx_key, 0, sizeof(config.rx_key));
     signal(SIGINT, handle_signal);
@@ -1195,6 +1398,9 @@ int main(int argc, char **argv)
         fprintf(stderr, "three enabled lcores are required for RX, crypto and TX\n");
         goto cleanup_ports;
     }
+    printf("mode=%s mtu=%u max_plain_frame=%zu vlan_maps=%u\n",
+           config.no_crypto ? "no-crypto(E0)" : "macsec", config.mtu,
+           pipeline.max_plain_frame, config.vlan.count);
     printf("plain port %" PRIu16 " <-> secure port %" PRIu16
            "; RX lcore=%u crypto lcore=%u TX lcore=%u; press Ctrl-C to stop\n",
            config.plain_port, config.secure_port, rte_lcore_id(), worker_lcore,
@@ -1407,20 +1613,23 @@ int main(int argc, char **argv)
                                               (double)runtime_us;
         printf("runtime_us=%" PRIu64 " processed=%" PRIu64 " pps=%.1f\n",
                runtime_us, processed, packets_per_second);
+        print_sa_stats(&stats);
         if (config.latency_stats) print_latency_stats(&stats);
     }
     exit_code = EXIT_SUCCESS;
 
 cleanup_ports:
-    macsec_set_aead_backend(NULL, NULL);
-    rte_cryptodev_stop(crypto.device_id);
-    for (size_t i = 0; i < RTE_DIM(crypto.sessions); i++) {
-        if (crypto.sessions[i].valid) {
-            rte_cryptodev_sym_session_free(crypto.device_id,
-                                           crypto.sessions[i].session);
+    if (crypto_ready) {
+        macsec_set_aead_backend(NULL, NULL);
+        rte_cryptodev_stop(crypto.device_id);
+        for (size_t i = 0; i < RTE_DIM(crypto.sessions); i++) {
+            if (crypto.sessions[i].valid) {
+                rte_cryptodev_sym_session_free(crypto.device_id,
+                                               crypto.sessions[i].session);
+            }
         }
+        rte_cryptodev_close(crypto.device_id);
     }
-    rte_cryptodev_close(crypto.device_id);
     if (rte_eth_dev_is_valid_port(config.plain_port)) {
         rte_eth_dev_stop(config.plain_port);
         rte_eth_dev_close(config.plain_port);
