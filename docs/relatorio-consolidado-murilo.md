@@ -66,7 +66,7 @@ A cripto acrescenta ~1–3 µs (p50) e até ~6 µs (p99) por sentido a 8950 B. *
 
 1. **Fase 1 do MKA:** aceitar GCM-AES-256 (PN 32 bits) com rekey antes de esgotar o PN e deixar XPN no KaY para depois, ou exigir XPN? O gateway e o kernel já falam XPN.
 2. **Ponte de chaves na fase 1:** CAK/CKN pelo nosso canal TLS PQC ou outro canal PQC (por exemplo, OpenSSH `mlkem768x25519-sha256`)?
-3. **Emulador de RU:** há um `ru_emulator` no código do OCUDU (`apps/examples/ofh`; compilado aqui contra a DPDK 26.07). A versão do OCUDU da testbed o inclui? Ele serve para a F4 sem hardware, mas **não valida a margem de uplink** (seção 4).
+3. **Emulador de RU:** há um `ru_emulator` no código do OCUDU (`apps/examples/ofh`; compilado aqui contra a DPDK 26.07). O gNB `gnb_split_7_2` também compilou e fala OFH com ele por `veth` no notebook, sem root, com 0 quadros corrompidos em 241 mil (timing ruim sem tempo real). A versão do OCUDU da testbed o inclui? Ele serve para a F4 sem hardware, mas **não valida a margem de uplink** (seção 4).
 4. **Versões exatas** do OCUDU, DPDK e IPsec-MB da testbed, e política de imagem pública (sem segredos).
 5. **Acesso:** `ROADMAP.md` e a branch `macsec_pqc`.
 6. **Experimentos prévios** sem MACsec, para medir o caminho real: E-1 (OCUDU direto) e E0 (gateway só com troca de VLAN), que separam o custo do salto extra do custo da cifra. E confirmar nos ToRs: EAPOL unicast, VLAN 2161–2163 e MTU 9000.
