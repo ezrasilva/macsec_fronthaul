@@ -12,6 +12,9 @@
 #define MACSEC_MAX_REPLAY_WINDOW 64U
 #define MACSEC_ETHERTYPE 0x88E5U
 #define MACSEC_FRAME_OVERHEAD 32U
+#define MACSEC_SECTAG_LEN 16U
+#define MACSEC_AAD_LEN 28U       /* DA SA 88E5 TCI SL PN SCI */
+#define MACSEC_MAX_L2_LEN 16U    /* DA SA + uma tag 802.1Q/802.1ad */
 
 enum macsec_status {
     MACSEC_OK = 0,
@@ -62,6 +65,9 @@ struct macsec_crypto_request {
     uint8_t *output;
     uint8_t *tag;
     uint64_t packet_number;
+    size_t l2_len;                       /* DA SA [VLAN], antes do SecTAG */
+    uint8_t aad_storage[MACSEC_AAD_LEN]; /* aad aponta aqui: nao copiar o struct
+                                            sem refazer o ponteiro */
 };
 
 void macsec_tx_sa_init(struct macsec_tx_sa *sa,
@@ -111,10 +117,17 @@ enum macsec_status macsec_prepare_protect_in_place(
     size_t frame_capacity, size_t *secure_len,
     struct macsec_crypto_request *request);
 
-/* Prepares a layout where DA/SA are at frame[0..11] and the original
- * EtherType/payload has already been positioned at frame[28]. */
+/* Tamanho de DA SA [VLAN] de um quadro em claro (12 ou 16); 0 se invalido. */
+size_t macsec_l2_header_len(const uint8_t *frame, size_t len);
+
+/* true se o quadro tem SecTAG (apos DA SA [VLAN]); devolve o AN. */
+bool macsec_peek_secure(const uint8_t *frame, size_t len, uint8_t *an);
+
+/* Layout: DA SA [VLAN] ocupam frame[0..l2-1]; o SecTAG (16 B) vai em
+ * frame[l2..l2+15] e o EtherType/payload original ja esta em frame[l2+16].
+ * plain_len e o tamanho do quadro em claro (l2 + EtherType + payload). */
 enum macsec_status macsec_prepare_protect_direct(
-    struct macsec_tx_sa *sa, uint8_t *frame, size_t plain_len,
+    struct macsec_tx_sa *sa, uint8_t *frame, size_t l2, size_t plain_len,
     size_t frame_capacity, size_t *secure_len,
     struct macsec_crypto_request *request);
 

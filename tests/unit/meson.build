@@ -6,6 +6,14 @@ unit_test = executable(
 
 test('macsec-unit', unit_test)
 
+vlan_test = executable(
+  'test_macsec_vlan',
+  'test_macsec_vlan.c',
+  dependencies: macsec_dep,
+)
+
+test('macsec-vlan-unit', vlan_test)
+
 key_control_test = executable(
   'test_key_control',
   'test_key_control.c',

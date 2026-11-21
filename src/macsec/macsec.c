@@ -7,7 +7,7 @@
 #define ETHERNET_HEADER_LEN 14U
 #define MAC_ADDRESSES_LEN 12U
 #define SECTAG_WITH_SCI_LEN 16U
-#define SECURE_HEADER_LEN (MAC_ADDRESSES_LEN + SECTAG_WITH_SCI_LEN)
+#define VLAN_TAG_LEN 4U
 #define MACSEC_OVERHEAD (SECTAG_WITH_SCI_LEN + MACSEC_ICV_LEN)
 
 #define TCI_SC 0x20U
@@ -222,48 +222,193 @@ void macsec_rx_sa_init(struct macsec_rx_sa *sa,
                             : replay_window;
 }
 
+/* Layout (VLAN opcional fica FORA do AAD, do ICV e da cifra):
+ *   plain : DA SA [8100 TCI] ET payload
+ *   secure: DA SA [8100 TCI] 88E5 SecTAG(TCI SL PN SCI) ET payload ICV
+ *   AAD   : DA SA 88E5 TCI SL PN SCI (28 bytes, montado em buffer proprio) */
+
+static bool is_vlan_ethertype(uint16_t et)
+{
+    return et == 0x8100U || et == 0x88a8U;
+}
+
+size_t macsec_l2_header_len(const uint8_t *frame, size_t len)
+{
+    size_t hdr;
+
+    if (frame == NULL || len < ETHERNET_HEADER_LEN) return 0U;
+    hdr = is_vlan_ethertype(load_be16(frame + 12)) ? MAC_ADDRESSES_LEN + VLAN_TAG_LEN
+                                                    : MAC_ADDRESSES_LEN;
+    return len >= hdr + 2U ? hdr : 0U;
+}
+
+bool macsec_peek_secure(const uint8_t *frame, size_t len, uint8_t *an)
+{
+    size_t l2;
+
+    if (frame == NULL || len < MAC_ADDRESSES_LEN + 2U) return false;
+    l2 = is_vlan_ethertype(load_be16(frame + 12)) ? MAC_ADDRESSES_LEN + VLAN_TAG_LEN
+                                                   : MAC_ADDRESSES_LEN;
+    if (len < l2 + 3U || load_be16(frame + l2) != MACSEC_ETHERTYPE) return false;
+    if (an != NULL) *an = frame[l2 + 2U] & TCI_AN_MASK;
+    return true;
+}
+
+static void write_sectag(uint8_t *p, const struct macsec_tx_sa *sa,
+                         size_t protected_len, uint64_t pn)
+{
+    store_be16(p, MACSEC_ETHERTYPE);
+    p[2] = (uint8_t)(TCI_PROFILE | sa->association_number);
+    p[3] = protected_len < 48U ? (uint8_t)protected_len : 0U;
+    store_be32(p + 4, (uint32_t)pn);
+    memcpy(p + 8, sa->sci, MACSEC_SCI_LEN);
+}
+
+static void build_aad(uint8_t aad[MACSEC_AAD_LEN], const uint8_t *macs,
+                      const uint8_t *sectag)
+{
+    memcpy(aad, macs, MAC_ADDRESSES_LEN);
+    memcpy(aad + MAC_ADDRESSES_LEN, sectag, SECTAG_WITH_SCI_LEN);
+}
+
+static void fill_request(struct macsec_crypto_request *request, bool encrypt,
+                         const uint8_t *key, uint32_t ssci, uint64_t pn,
+                         const uint8_t *salt, size_t l2, const uint8_t *input,
+                         size_t input_len, uint8_t *output, uint8_t *tag)
+{
+    request->encrypt = encrypt;
+    request->key = key;
+    make_xpn_nonce(request->nonce, ssci, pn, salt);
+    request->aad = request->aad_storage;
+    request->aad_len = MACSEC_AAD_LEN;
+    request->input = input;
+    request->input_len = input_len;
+    request->output = output;
+    request->tag = tag;
+    request->packet_number = pn;
+    request->l2_len = l2;
+}
+
+/* secure_frame: DA SA [VLAN] <espaco p/ SecTAG> ET payload <espaco p/ ICV>.
+ * O chamador ja posicionou ET/payload em frame[l2 + 16]. */
+static enum macsec_status protect_layout(
+    struct macsec_tx_sa *sa, uint8_t *frame, size_t l2, size_t plain_len,
+    const uint8_t *input, uint8_t *output, size_t *secure_len,
+    struct macsec_crypto_request *request)
+{
+    size_t protected_len = plain_len - l2;
+    uint64_t pn = sa->next_pn;
+
+    write_sectag(frame + l2, sa, protected_len, pn);
+    memset(request, 0, sizeof(*request));
+    build_aad(request->aad_storage, frame, frame + l2);
+    fill_request(request, true, sa->key, sa->ssci, pn, sa->salt, l2, input,
+                 protected_len, output, output + protected_len);
+    *secure_len = plain_len + MACSEC_OVERHEAD;
+    /* Reservar o PN antes da submissao assincrona evita reutilizar nonce. */
+    sa->next_pn = pn == UINT64_MAX ? 0U : pn + 1U;
+    return MACSEC_OK;
+}
+
+static enum macsec_status protect_check_l2(const struct macsec_tx_sa *sa,
+                                           size_t l2, size_t plain_len,
+                                           size_t capacity)
+{
+    if (sa == NULL || (l2 != MAC_ADDRESSES_LEN && l2 != MAC_ADDRESSES_LEN + VLAN_TAG_LEN) ||
+        plain_len < l2 + 2U) return MACSEC_ERR_ARGUMENT;
+    if (sa->next_pn == 0U) return MACSEC_ERR_PN_EXHAUSTED;
+    if (plain_len > SIZE_MAX - MACSEC_OVERHEAD || capacity < plain_len + MACSEC_OVERHEAD)
+        return MACSEC_ERR_CAPACITY;
+    return MACSEC_OK;
+}
+
+static enum macsec_status protect_check(const struct macsec_tx_sa *sa,
+                                        const uint8_t *frame, size_t plain_len,
+                                        size_t capacity, size_t *l2)
+{
+    if (sa == NULL || frame == NULL) return MACSEC_ERR_ARGUMENT;
+    *l2 = macsec_l2_header_len(frame, plain_len);
+    return protect_check_l2(sa, *l2, plain_len, capacity);
+}
+
 enum macsec_status macsec_prepare_protect(
     struct macsec_tx_sa *sa, const uint8_t *plain_frame, size_t plain_len,
     uint8_t *secure_frame, size_t secure_capacity, size_t *secure_len,
     struct macsec_crypto_request *request)
 {
-    size_t protected_len;
-    uint64_t pn;
+    size_t l2;
+    enum macsec_status status;
 
-    if (sa == NULL || plain_frame == NULL || secure_frame == NULL ||
-        secure_len == NULL || request == NULL || plain_len < ETHERNET_HEADER_LEN) {
+    if (secure_frame == NULL || secure_len == NULL || request == NULL)
         return MACSEC_ERR_ARGUMENT;
-    }
-    if (sa->next_pn == 0U) return MACSEC_ERR_PN_EXHAUSTED;
-    if (plain_len > SIZE_MAX - MACSEC_OVERHEAD ||
-        secure_capacity < plain_len + MACSEC_OVERHEAD) {
-        return MACSEC_ERR_CAPACITY;
-    }
-    protected_len = plain_len - MAC_ADDRESSES_LEN;
-    pn = sa->next_pn;
-    memcpy(secure_frame, plain_frame, MAC_ADDRESSES_LEN);
-    store_be16(secure_frame + 12, MACSEC_ETHERTYPE);
-    secure_frame[14] = (uint8_t)(TCI_PROFILE | sa->association_number);
-    secure_frame[15] = protected_len < 48U ? (uint8_t)protected_len : 0U;
-    store_be32(secure_frame + 16, (uint32_t)pn);
-    memcpy(secure_frame + 20, sa->sci, MACSEC_SCI_LEN);
+    status = protect_check(sa, plain_frame, plain_len, secure_capacity, &l2);
+    if (status != MACSEC_OK) return status;
+    memcpy(secure_frame, plain_frame, l2);
+    return protect_layout(sa, secure_frame, l2, plain_len, plain_frame + l2,
+                          secure_frame + l2 + SECTAG_WITH_SCI_LEN, secure_len,
+                          request);
+}
 
-    memset(request, 0, sizeof(*request));
-    request->encrypt = true;
-    request->key = sa->key;
-    make_xpn_nonce(request->nonce, sa->ssci, pn, sa->salt);
-    request->aad = secure_frame;
-    request->aad_len = SECURE_HEADER_LEN;
-    request->input = plain_frame + MAC_ADDRESSES_LEN;
-    request->input_len = protected_len;
-    request->output = secure_frame + SECURE_HEADER_LEN;
-    request->tag = request->output + protected_len;
-    request->packet_number = pn;
-    *secure_len = SECURE_HEADER_LEN + protected_len + MACSEC_ICV_LEN;
+enum macsec_status macsec_prepare_protect_direct(
+    struct macsec_tx_sa *sa, uint8_t *frame, size_t l2, size_t plain_len,
+    size_t frame_capacity, size_t *secure_len,
+    struct macsec_crypto_request *request)
+{
+    enum macsec_status status;
 
-    /* Reserving a PN before asynchronous submission prevents nonce reuse if
-     * an operation fails after other requests have already been queued. */
-    sa->next_pn = pn == UINT64_MAX ? 0U : pn + 1U;
+    if (frame == NULL || secure_len == NULL || request == NULL)
+        return MACSEC_ERR_ARGUMENT;
+    status = protect_check_l2(sa, l2, plain_len, frame_capacity);
+    if (status != MACSEC_OK) return status;
+    return protect_layout(sa, frame, l2, plain_len,
+                          frame + l2 + SECTAG_WITH_SCI_LEN,
+                          frame + l2 + SECTAG_WITH_SCI_LEN, secure_len, request);
+}
+
+enum macsec_status macsec_prepare_protect_in_place(
+    struct macsec_tx_sa *sa, uint8_t *frame, size_t plain_len,
+    size_t frame_capacity, size_t *secure_len,
+    struct macsec_crypto_request *request)
+{
+    size_t l2;
+    enum macsec_status status;
+
+    if (secure_len == NULL || request == NULL) return MACSEC_ERR_ARGUMENT;
+    status = protect_check(sa, frame, plain_len, frame_capacity, &l2);
+    if (status != MACSEC_OK) return status;
+    memmove(frame + l2 + SECTAG_WITH_SCI_LEN, frame + l2, plain_len - l2);
+    return protect_layout(sa, frame, l2, plain_len,
+                          frame + l2 + SECTAG_WITH_SCI_LEN,
+                          frame + l2 + SECTAG_WITH_SCI_LEN, secure_len, request);
+}
+
+static enum macsec_status parse_secure(const struct macsec_rx_sa *sa,
+                                       const uint8_t *frame, size_t len,
+                                       size_t *l2_out, size_t *protected_len,
+                                       uint64_t *pn)
+{
+    size_t l2;
+    const uint8_t *tag;
+    uint8_t tci;
+    uint8_t short_length;
+
+    if (len < MAC_ADDRESSES_LEN + 2U) return MACSEC_ERR_FORMAT;
+    l2 = is_vlan_ethertype(load_be16(frame + 12)) ? MAC_ADDRESSES_LEN + VLAN_TAG_LEN
+                                                   : MAC_ADDRESSES_LEN;
+    if (len < l2 + SECTAG_WITH_SCI_LEN + 2U + MACSEC_ICV_LEN ||
+        load_be16(frame + l2) != MACSEC_ETHERTYPE) return MACSEC_ERR_FORMAT;
+    tag = frame + l2;
+    tci = tag[2];
+    if ((tci & (TCI_SC | TCI_E | TCI_C)) != TCI_PROFILE ||
+        (tci & TCI_AN_MASK) != sa->association_number ||
+        memcmp(tag + 8, sa->sci, MACSEC_SCI_LEN) != 0) return MACSEC_ERR_FORMAT;
+    *protected_len = len - l2 - SECTAG_WITH_SCI_LEN - MACSEC_ICV_LEN;
+    short_length = tag[3];
+    if ((*protected_len < 48U && short_length != *protected_len) ||
+        (*protected_len >= 48U && short_length != 0U)) return MACSEC_ERR_FORMAT;
+    *pn = recover_xpn(sa, load_be32(tag + 4));
+    if (replay_rejected(sa, *pn)) return MACSEC_ERR_REPLAY;
+    *l2_out = l2;
     return MACSEC_OK;
 }
 
@@ -272,44 +417,23 @@ enum macsec_status macsec_prepare_unprotect(
     uint8_t *plain_frame, size_t plain_capacity, size_t *plain_len,
     struct macsec_crypto_request *request)
 {
-    size_t protected_len;
-    size_t result_len;
-    uint8_t tci;
-    uint8_t short_length;
+    size_t l2, protected_len;
     uint64_t pn;
+    enum macsec_status status;
 
     if (sa == NULL || secure_frame == NULL || plain_frame == NULL ||
         plain_len == NULL || request == NULL) return MACSEC_ERR_ARGUMENT;
-    if (secure_len < SECURE_HEADER_LEN + 2U + MACSEC_ICV_LEN ||
-        load_be16(secure_frame + 12) != MACSEC_ETHERTYPE) return MACSEC_ERR_FORMAT;
-    tci = secure_frame[14];
-    if ((tci & (TCI_SC | TCI_E | TCI_C)) != TCI_PROFILE ||
-        (tci & TCI_AN_MASK) != sa->association_number ||
-        memcmp(secure_frame + 20, sa->sci, MACSEC_SCI_LEN) != 0) {
-        return MACSEC_ERR_FORMAT;
-    }
-    protected_len = secure_len - SECURE_HEADER_LEN - MACSEC_ICV_LEN;
-    short_length = secure_frame[15];
-    if ((protected_len < 48U && short_length != protected_len) ||
-        (protected_len >= 48U && short_length != 0U)) return MACSEC_ERR_FORMAT;
-    result_len = MAC_ADDRESSES_LEN + protected_len;
-    if (plain_capacity < result_len) return MACSEC_ERR_CAPACITY;
-    pn = recover_xpn(sa, load_be32(secure_frame + 16));
-    if (replay_rejected(sa, pn)) return MACSEC_ERR_REPLAY;
-
-    memcpy(plain_frame, secure_frame, MAC_ADDRESSES_LEN);
+    status = parse_secure(sa, secure_frame, secure_len, &l2, &protected_len, &pn);
+    if (status != MACSEC_OK) return status;
+    if (plain_capacity < l2 + protected_len) return MACSEC_ERR_CAPACITY;
+    memcpy(plain_frame, secure_frame, l2);
     memset(request, 0, sizeof(*request));
-    request->encrypt = false;
-    request->key = sa->key;
-    make_xpn_nonce(request->nonce, sa->ssci, pn, sa->salt);
-    request->aad = secure_frame;
-    request->aad_len = SECURE_HEADER_LEN;
-    request->input = secure_frame + SECURE_HEADER_LEN;
-    request->input_len = protected_len;
-    request->output = plain_frame + MAC_ADDRESSES_LEN;
-    request->tag = (uint8_t *)(secure_frame + SECURE_HEADER_LEN + protected_len);
-    request->packet_number = pn;
-    *plain_len = result_len;
+    build_aad(request->aad_storage, secure_frame, secure_frame + l2);
+    fill_request(request, false, sa->key, sa->ssci, pn, sa->salt, l2,
+                 secure_frame + l2 + SECTAG_WITH_SCI_LEN, protected_len,
+                 plain_frame + l2,
+                 (uint8_t *)(secure_frame + l2 + SECTAG_WITH_SCI_LEN + protected_len));
+    *plain_len = l2 + protected_len;
     return MACSEC_OK;
 }
 
@@ -324,92 +448,25 @@ enum macsec_status macsec_complete_unprotect(
     return MACSEC_OK;
 }
 
-enum macsec_status macsec_prepare_protect_direct(
-    struct macsec_tx_sa *sa, uint8_t *frame, size_t plain_len,
-    size_t frame_capacity, size_t *secure_len,
-    struct macsec_crypto_request *request)
-{
-    size_t protected_len;
-    uint64_t pn;
-
-    if (sa == NULL || frame == NULL || secure_len == NULL || request == NULL ||
-        plain_len < ETHERNET_HEADER_LEN) return MACSEC_ERR_ARGUMENT;
-    if (sa->next_pn == 0U) return MACSEC_ERR_PN_EXHAUSTED;
-    if (plain_len > SIZE_MAX - MACSEC_OVERHEAD ||
-        frame_capacity < plain_len + MACSEC_OVERHEAD) return MACSEC_ERR_CAPACITY;
-    protected_len = plain_len - MAC_ADDRESSES_LEN;
-    pn = sa->next_pn;
-    store_be16(frame + 12, MACSEC_ETHERTYPE);
-    frame[14] = (uint8_t)(TCI_PROFILE | sa->association_number);
-    frame[15] = protected_len < 48U ? (uint8_t)protected_len : 0U;
-    store_be32(frame + 16, (uint32_t)pn);
-    memcpy(frame + 20, sa->sci, MACSEC_SCI_LEN);
-    memset(request, 0, sizeof(*request));
-    request->encrypt = true;
-    request->key = sa->key;
-    make_xpn_nonce(request->nonce, sa->ssci, pn, sa->salt);
-    request->aad = frame;
-    request->aad_len = SECURE_HEADER_LEN;
-    request->input = frame + SECURE_HEADER_LEN;
-    request->input_len = protected_len;
-    request->output = frame + SECURE_HEADER_LEN;
-    request->tag = request->output + protected_len;
-    request->packet_number = pn;
-    *secure_len = plain_len + MACSEC_OVERHEAD;
-    sa->next_pn = pn == UINT64_MAX ? 0U : pn + 1U;
-    return MACSEC_OK;
-}
-
-enum macsec_status macsec_prepare_protect_in_place(
-    struct macsec_tx_sa *sa, uint8_t *frame, size_t plain_len,
-    size_t frame_capacity, size_t *secure_len,
-    struct macsec_crypto_request *request)
-{
-    if (sa == NULL || frame == NULL || secure_len == NULL || request == NULL ||
-        plain_len < ETHERNET_HEADER_LEN) return MACSEC_ERR_ARGUMENT;
-    if (plain_len > SIZE_MAX - MACSEC_OVERHEAD ||
-        frame_capacity < plain_len + MACSEC_OVERHEAD) return MACSEC_ERR_CAPACITY;
-    memmove(frame + SECURE_HEADER_LEN, frame + MAC_ADDRESSES_LEN,
-            plain_len - MAC_ADDRESSES_LEN);
-    return macsec_prepare_protect_direct(sa, frame, plain_len, frame_capacity,
-                                         secure_len, request);
-}
-
 enum macsec_status macsec_prepare_unprotect_in_place(
     struct macsec_rx_sa *sa, uint8_t *frame, size_t secure_len,
     size_t *plain_len, struct macsec_crypto_request *request)
 {
-    size_t protected_len;
-    uint8_t tci;
-    uint8_t short_length;
+    size_t l2, protected_len;
     uint64_t pn;
+    enum macsec_status status;
 
     if (sa == NULL || frame == NULL || plain_len == NULL || request == NULL)
         return MACSEC_ERR_ARGUMENT;
-    if (secure_len < SECURE_HEADER_LEN + 2U + MACSEC_ICV_LEN ||
-        load_be16(frame + 12) != MACSEC_ETHERTYPE) return MACSEC_ERR_FORMAT;
-    tci = frame[14];
-    if ((tci & (TCI_SC | TCI_E | TCI_C)) != TCI_PROFILE ||
-        (tci & TCI_AN_MASK) != sa->association_number ||
-        memcmp(frame + 20, sa->sci, MACSEC_SCI_LEN) != 0) return MACSEC_ERR_FORMAT;
-    protected_len = secure_len - SECURE_HEADER_LEN - MACSEC_ICV_LEN;
-    short_length = frame[15];
-    if ((protected_len < 48U && short_length != protected_len) ||
-        (protected_len >= 48U && short_length != 0U)) return MACSEC_ERR_FORMAT;
-    pn = recover_xpn(sa, load_be32(frame + 16));
-    if (replay_rejected(sa, pn)) return MACSEC_ERR_REPLAY;
+    status = parse_secure(sa, frame, secure_len, &l2, &protected_len, &pn);
+    if (status != MACSEC_OK) return status;
     memset(request, 0, sizeof(*request));
-    request->encrypt = false;
-    request->key = sa->key;
-    make_xpn_nonce(request->nonce, sa->ssci, pn, sa->salt);
-    request->aad = frame;
-    request->aad_len = SECURE_HEADER_LEN;
-    request->input = frame + SECURE_HEADER_LEN;
-    request->input_len = protected_len;
-    request->output = frame + SECURE_HEADER_LEN;
-    request->tag = frame + SECURE_HEADER_LEN + protected_len;
-    request->packet_number = pn;
-    *plain_len = MAC_ADDRESSES_LEN + protected_len;
+    build_aad(request->aad_storage, frame, frame + l2);
+    fill_request(request, false, sa->key, sa->ssci, pn, sa->salt, l2,
+                 frame + l2 + SECTAG_WITH_SCI_LEN, protected_len,
+                 frame + l2 + SECTAG_WITH_SCI_LEN,
+                 frame + l2 + SECTAG_WITH_SCI_LEN + protected_len);
+    *plain_len = l2 + protected_len;
     return MACSEC_OK;
 }
 
@@ -420,9 +477,31 @@ enum macsec_status macsec_finish_unprotect_in_place(
     enum macsec_status status =
         macsec_complete_unprotect(sa, request, crypto_status);
     if (status != MACSEC_OK) return status;
-    memmove(frame + MAC_ADDRESSES_LEN, frame + SECURE_HEADER_LEN,
-            request->input_len);
+    memmove(frame + request->l2_len,
+            frame + request->l2_len + SECTAG_WITH_SCI_LEN, request->input_len);
     return MACSEC_OK;
+}
+
+static enum macsec_status run_backend(const struct macsec_crypto_request *r,
+                                      const uint8_t *tag_in)
+{
+    uint8_t tag[MACSEC_ICV_LEN];
+
+    if (r->encrypt) {
+        return aead_backend != NULL
+                   ? aead_backend(true, r->key, r->nonce, r->aad, r->aad_len,
+                                  r->input, r->input_len, r->output, r->tag,
+                                  aead_backend_context)
+                   : gcm_encrypt(r->key, r->nonce, r->aad, r->aad_len, r->input,
+                                 r->input_len, r->output, r->tag);
+    }
+    memcpy(tag, tag_in, sizeof(tag));
+    return aead_backend != NULL
+               ? aead_backend(false, r->key, r->nonce, r->aad, r->aad_len,
+                              r->input, r->input_len, r->output, tag,
+                              aead_backend_context)
+               : gcm_decrypt(r->key, r->nonce, r->aad, r->aad_len, r->input,
+                             r->input_len, tag, r->output);
 }
 
 enum macsec_status macsec_protect(struct macsec_tx_sa *sa,
@@ -432,48 +511,18 @@ enum macsec_status macsec_protect(struct macsec_tx_sa *sa,
                                   size_t secure_capacity,
                                   size_t *secure_len)
 {
-    size_t protected_len;
-    uint8_t nonce[12];
-    uint8_t *tag;
+    struct macsec_crypto_request request;
+    uint64_t saved_pn;
     enum macsec_status status;
 
-    if (sa == NULL || plain_frame == NULL || secure_frame == NULL || secure_len == NULL ||
-        plain_len < ETHERNET_HEADER_LEN) {
-        return MACSEC_ERR_ARGUMENT;
-    }
-    if (sa->next_pn == 0U) {
-        return MACSEC_ERR_PN_EXHAUSTED;
-    }
-    if (plain_len > SIZE_MAX - MACSEC_OVERHEAD ||
-        secure_capacity < plain_len + MACSEC_OVERHEAD) {
-        return MACSEC_ERR_CAPACITY;
-    }
-
-    protected_len = plain_len - MAC_ADDRESSES_LEN;
-    memcpy(secure_frame, plain_frame, MAC_ADDRESSES_LEN);
-    store_be16(secure_frame + 12, MACSEC_ETHERTYPE);
-    secure_frame[14] = (uint8_t)(TCI_PROFILE | sa->association_number);
-    secure_frame[15] = protected_len < 48U ? (uint8_t)protected_len : 0U;
-    store_be32(secure_frame + 16, (uint32_t)sa->next_pn);
-    memcpy(secure_frame + 20, sa->sci, MACSEC_SCI_LEN);
-
-    make_xpn_nonce(nonce, sa->ssci, sa->next_pn, sa->salt);
-    tag = secure_frame + SECURE_HEADER_LEN + protected_len;
-    status = aead_backend != NULL
-                 ? aead_backend(true, sa->key, nonce, secure_frame,
-                                SECURE_HEADER_LEN, plain_frame + MAC_ADDRESSES_LEN,
-                                protected_len, secure_frame + SECURE_HEADER_LEN,
-                                tag, aead_backend_context)
-                 : gcm_encrypt(sa->key, nonce, secure_frame, SECURE_HEADER_LEN,
-                               plain_frame + MAC_ADDRESSES_LEN, protected_len,
-                               secure_frame + SECURE_HEADER_LEN, tag);
-    if (status != MACSEC_OK) {
-        return status;
-    }
-
-    *secure_len = SECURE_HEADER_LEN + protected_len + MACSEC_ICV_LEN;
-    sa->next_pn = sa->next_pn == UINT64_MAX ? 0U : sa->next_pn + 1U;
-    return MACSEC_OK;
+    if (sa == NULL) return MACSEC_ERR_ARGUMENT;
+    saved_pn = sa->next_pn;
+    status = macsec_prepare_protect(sa, plain_frame, plain_len, secure_frame,
+                                    secure_capacity, secure_len, &request);
+    if (status != MACSEC_OK) return status;
+    status = run_backend(&request, NULL);
+    if (status != MACSEC_OK) sa->next_pn = saved_pn;  /* nada saiu na rede */
+    return status;
 }
 
 enum macsec_status macsec_unprotect(struct macsec_rx_sa *sa,
@@ -483,67 +532,14 @@ enum macsec_status macsec_unprotect(struct macsec_rx_sa *sa,
                                     size_t plain_capacity,
                                     size_t *plain_len)
 {
-    size_t protected_len;
-    size_t result_len;
-    uint8_t nonce[12];
-    uint8_t tci;
-    uint8_t short_length;
-    uint64_t pn;
+    struct macsec_crypto_request request;
     enum macsec_status status;
 
-    if (sa == NULL || secure_frame == NULL || plain_frame == NULL || plain_len == NULL) {
-        return MACSEC_ERR_ARGUMENT;
-    }
-    if (secure_len < SECURE_HEADER_LEN + 2U + MACSEC_ICV_LEN ||
-        load_be16(secure_frame + 12) != MACSEC_ETHERTYPE) {
-        return MACSEC_ERR_FORMAT;
-    }
-    tci = secure_frame[14];
-    if ((tci & (TCI_SC | TCI_E | TCI_C)) != TCI_PROFILE ||
-        (tci & TCI_AN_MASK) != sa->association_number ||
-        memcmp(secure_frame + 20, sa->sci, MACSEC_SCI_LEN) != 0) {
-        return MACSEC_ERR_FORMAT;
-    }
-
-    protected_len = secure_len - SECURE_HEADER_LEN - MACSEC_ICV_LEN;
-    short_length = secure_frame[15];
-    if ((protected_len < 48U && short_length != protected_len) ||
-        (protected_len >= 48U && short_length != 0U)) {
-        return MACSEC_ERR_FORMAT;
-    }
-    result_len = MAC_ADDRESSES_LEN + protected_len;
-    if (plain_capacity < result_len) {
-        return MACSEC_ERR_CAPACITY;
-    }
-
-    pn = recover_xpn(sa, load_be32(secure_frame + 16));
-    if (replay_rejected(sa, pn)) {
-        return MACSEC_ERR_REPLAY;
-    }
-    make_xpn_nonce(nonce, sa->ssci, pn, sa->salt);
-    memcpy(plain_frame, secure_frame, MAC_ADDRESSES_LEN);
-    if (aead_backend != NULL) {
-        uint8_t tag[MACSEC_ICV_LEN];
-
-        memcpy(tag, secure_frame + SECURE_HEADER_LEN + protected_len,
-               sizeof(tag));
-        status = aead_backend(false, sa->key, nonce, secure_frame,
-                              SECURE_HEADER_LEN, secure_frame + SECURE_HEADER_LEN,
-                              protected_len, plain_frame + MAC_ADDRESSES_LEN,
-                              tag, aead_backend_context);
-    } else {
-        status = gcm_decrypt(sa->key, nonce, secure_frame, SECURE_HEADER_LEN,
-                             secure_frame + SECURE_HEADER_LEN, protected_len,
-                             secure_frame + SECURE_HEADER_LEN + protected_len,
-                             plain_frame + MAC_ADDRESSES_LEN);
-    }
-    if (status != MACSEC_OK) {
-        return status;
-    }
-
-    replay_accept(sa, pn);
-    *plain_len = result_len;
-    return MACSEC_OK;
+    status = macsec_prepare_unprotect(sa, secure_frame, secure_len, plain_frame,
+                                      plain_capacity, plain_len, &request);
+    if (status != MACSEC_OK) return status;
+    status = run_backend(&request, request.tag);
+    return macsec_complete_unprotect(sa, &request, status);
 }
 
 const char *macsec_status_string(enum macsec_status status)

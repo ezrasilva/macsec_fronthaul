@@ -855,40 +855,42 @@ static int crypto_stage(void *argument)
         atomic_store_explicit(&pipeline->worker_busy, true, memory_order_release);
         for (i = 0; i < count; i++) {
             uint8_t *frame;
-            struct macsec_crypto_request request;
+            struct macsec_crypto_request *request = &requests[request_count];
+            uint8_t an = 0;
 
             statuses[i] = MACSEC_ERR_FORMAT;
             if (rte_pktmbuf_linearize(jobs[i]->packet) != 0) continue;
             frame = rte_pktmbuf_mtod(jobs[i]->packet, uint8_t *);
             frame_lens[i] = rte_pktmbuf_pkt_len(jobs[i]->packet);
             if (jobs[i]->protect) {
-                uint8_t mac_addresses[12];
-                memcpy(mac_addresses, frame, sizeof(mac_addresses));
-                if (rte_pktmbuf_headroom(jobs[i]->packet) < 16U ||
+                /* DA SA [VLAN] ficam na frente; o SecTAG entra depois deles. */
+                uint8_t l2_bytes[MACSEC_MAX_L2_LEN];
+                size_t l2 = macsec_l2_header_len(frame, frame_lens[i]);
+                if (l2 == 0U) continue;
+                memcpy(l2_bytes, frame, l2);
+                if (rte_pktmbuf_headroom(jobs[i]->packet) < MACSEC_SECTAG_LEN ||
                     rte_pktmbuf_tailroom(jobs[i]->packet) < MACSEC_ICV_LEN ||
                     rte_pktmbuf_append(jobs[i]->packet, MACSEC_ICV_LEN) == NULL ||
-                    rte_pktmbuf_adj(jobs[i]->packet, 12U) == NULL ||
-                    rte_pktmbuf_prepend(jobs[i]->packet, 28U) == NULL) {
+                    rte_pktmbuf_adj(jobs[i]->packet, (uint16_t)l2) == NULL ||
+                    rte_pktmbuf_prepend(jobs[i]->packet,
+                                        (uint16_t)(l2 + MACSEC_SECTAG_LEN)) == NULL) {
                     statuses[i] = MACSEC_ERR_CAPACITY;
                     continue;
                 }
                 frame = rte_pktmbuf_mtod(jobs[i]->packet, uint8_t *);
-                memcpy(frame, mac_addresses, sizeof(mac_addresses));
+                memcpy(frame, l2_bytes, l2);
                 statuses[i] = macsec_prepare_protect_direct(
-                    &pipeline->tx_sa[jobs[i]->tx_an], frame, frame_lens[i],
-                    rte_pktmbuf_pkt_len(jobs[i]->packet), &result_lens[i], &request);
-            } else if (frame_lens[i] >= 15U && frame[12] == 0x88U &&
-                       frame[13] == 0xe5U &&
-                       atomic_load_explicit(&pipeline->rx_valid[frame[14] & 0x03U],
+                    &pipeline->tx_sa[jobs[i]->tx_an], frame, l2, frame_lens[i],
+                    rte_pktmbuf_pkt_len(jobs[i]->packet), &result_lens[i], request);
+            } else if (macsec_peek_secure(frame, frame_lens[i], &an) &&
+                       atomic_load_explicit(&pipeline->rx_valid[an],
                                             memory_order_acquire)) {
-                uint8_t an = frame[14] & 0x03U;
                 statuses[i] = macsec_prepare_unprotect_in_place(
                     &pipeline->rx_sa[an], frame, frame_lens[i], &result_lens[i],
-                    &request);
+                    request);
                 if (statuses[i] == MACSEC_OK) request_rx_sa[request_count] = &pipeline->rx_sa[an];
             }
             if (statuses[i] == MACSEC_OK) {
-                requests[request_count] = request;
                 request_packets[request_count] = jobs[i]->packet;
                 request_job[request_count] = (uint16_t)i;
                 request_count++;
@@ -902,18 +904,19 @@ static int crypto_stage(void *argument)
                 if (request_rx_sa[i] == NULL) {
                     statuses[job_index] = crypto_statuses[i];
                 } else {
-                    uint8_t mac_addresses[12];
+                    uint8_t l2_bytes[MACSEC_MAX_L2_LEN];
+                    size_t l2 = requests[i].l2_len;
                     uint8_t *frame = rte_pktmbuf_mtod(request_packets[i], uint8_t *);
-                    memcpy(mac_addresses, frame, sizeof(mac_addresses));
+                    memcpy(l2_bytes, frame, l2);
                     statuses[job_index] = macsec_complete_unprotect(
                         request_rx_sa[i], &requests[i], crypto_statuses[i]);
                     if (statuses[job_index] == MACSEC_OK) {
                         if (rte_pktmbuf_trim(request_packets[i], MACSEC_ICV_LEN) != 0 ||
-                            rte_pktmbuf_adj(request_packets[i], 16U) == NULL) {
+                            rte_pktmbuf_adj(request_packets[i], MACSEC_SECTAG_LEN) == NULL) {
                             statuses[job_index] = MACSEC_ERR_FORMAT;
                         } else {
                             frame = rte_pktmbuf_mtod(request_packets[i], uint8_t *);
-                            memcpy(frame, mac_addresses, sizeof(mac_addresses));
+                            memcpy(frame, l2_bytes, l2);
                         }
                     }
                 }
