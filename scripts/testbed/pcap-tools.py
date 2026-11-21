@@ -4,6 +4,8 @@
   pcap-tools.py vlan IN OUT VID      insere tag 802.1Q apos DA/SA em cada quadro
   pcap-tools.py check-secure PCAP N  confere N quadros [VLAN] 88e5 SecTAG, SCI e tamanho
   pcap-tools.py same A B             A e B contem os mesmos quadros, na mesma ordem
+  pcap-tools.py vids PCAP            VIDs externas + ethertype seguinte
+  pcap-tools.py pad IN OUT TOTAL     preenche cada quadro ate TOTAL bytes
 """
 import struct, sys
 
@@ -43,3 +45,14 @@ elif cmd == 'same':
     for i, (x, y) in enumerate(zip(a, b)):
         assert x[2] == y[2], 'quadro %d difere' % i
     print('ok: %d quadros identicos' % len(a))
+elif cmd == 'vids':   # VIDs externas e o ethertype seguinte, uma entrada por tipo
+    out = []
+    for _, _, b in read(sys.argv[2]):
+        if b[12:14] in (b'\x81\x00', b'\x88\xa8'):
+            out.append('%d/%s' % (struct.unpack('!H', b[14:16])[0] & 0xfff, b[16:18].hex()))
+        else:
+            out.append('untagged/%s' % b[12:14].hex())
+    print(' '.join(sorted(set(out))) + ' n=%d' % len(out))
+elif cmd == 'pad':    # pad IN OUT TOTAL: preenche cada quadro ate TOTAL bytes
+    total = int(sys.argv[4])
+    write(sys.argv[3], [(s, u, b + bytes(max(0, total - len(b)))) for s, u, b in read(sys.argv[2])])

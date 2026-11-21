@@ -70,7 +70,6 @@ test_() {
   ipa ip -s macsec show > "$OUT/macsec-stats-a.txt"
   ipb ip -s macsec show > "$OUT/macsec-stats-b.txt"
   tcpdump -nn -e -r "$OUT/baseline-kernel.pcap" 2>/dev/null | head -5 | tee "$OUT/pcap-head.txt"
-  chown -R "${SUDO_USER:-root}": "$OUT" 2>/dev/null || true
 }
 
 case "${1:-all}" in
