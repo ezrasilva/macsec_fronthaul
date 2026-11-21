@@ -28,7 +28,7 @@ KEYID=00000000000000000000000000000000
 
 nsx() { local n=$1; shift; ip netns exec "$n" "$@"; }
 
-down() { pkill -x poc_macsec_dpdk 2>/dev/null || true; for n in du gw ru; do ip netns del $n 2>/dev/null || true; done; }
+down() { pkill -x poc_macsec_dpdk 2>/dev/null || true; pkill -x poc_tls_keying 2>/dev/null || true; pkill -f 'kernel-control.py --socket' 2>/dev/null || true; pkill -x tcpdump 2>/dev/null || true; for n in du gw ru; do ip netns del $n 2>/dev/null || true; done; }
 
 up() { # $1 = e0|e1
   down
@@ -111,9 +111,12 @@ run() { # $1 = e0|e1
   [ $fail -eq 0 ] && echo "L3 $mode: OK" || { echo "L3 $mode: FALHOU (log: $log)"; return 1; }
 }
 
-case "${1:-all}" in
-  down) down ;;
-  e0) run e0 ;;
-  e1) run e1 ;;
-  all) run e0; run e1 ;;
-esac
+# so executa quando chamado diretamente (l4-rekey.sh inclui este arquivo com `source`)
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  case "${1:-all}" in
+    down) down ;;
+    e0) run e0 ;;
+    e1) run e1 ;;
+    all) run e0; run e1 ;;
+  esac
+fi
