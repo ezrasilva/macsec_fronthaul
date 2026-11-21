@@ -50,7 +50,7 @@ Prazos em dias de trabalho focado **[ESTIMATIVA]**, sem folga para imprevistos. 
 - Clonar de novo o `macsec_fronthaul` e o OCUDU; compilar DPDK 26.07 (versão que o testbed usa **[A CONFIRMAR]**), Intel IPsec-MB, hostap com MKA/MACsec, OpenSSL ≥ 3.5.
 - Reexecutar no notebook o teste de `port_init` com a DPDK 26.07 (pendente desde antes).
 - Ler `lib/ofh/ethernet` do OCUDU (transmitter, receiver, `frame_builder`, `vlan_frame_decoder`) para fixar os pontos de gancho da F4.
-- Pedir ao Murilo: `ROADMAP.md`, acesso à branch `macsec_pqc`, versão/imagem do OCUDU e do DPDK, e se há emulador de RU para testar sem hardware.
+- Pedir ao Murilo: `ROADMAP.md`, acesso à branch `macsec_pqc` e versão/imagem do OCUDU e do DPDK. (O emulador de RU **existe no código do OCUDU**: ver seção 7.)
 - **Aceite:** ambiente compila; lista dos pontos de gancho do OCUDU escrita.
 
 ### F1 — Núcleo SecY (3–5 dias)
@@ -84,7 +84,7 @@ Prazos em dias de trabalho focado **[ESTIMATIVA]**, sem folga para imprevistos. 
 - Socket de controle em thread fora do tempo real, reaproveitando `key_control.c` v2 e o mesmo driver do hostap.
 - Opções de configuração em `ru_ofh` (ligar/desligar, SCI, VLAN, cipher suite) e conta de `+24/+32 B` e do limite de 8950 B no MTU.
 - Imagem própria do OCUDU em repositório público (sem segredos) **[A CONFIRMAR com a RNP]**.
-- Validação sem RU real: testes de unidade da SecY e injeção de quadros contra o gateway; execução do gNB só se houver emulador de RU **[A CONFIRMAR]**.
+- Validação sem RU real: testes de unidade da SecY e injeção de quadros contra o gateway; e o `ru_emulator` do OCUDU (`apps/examples/ofh`) do lado red, em claro, com o gateway no meio (seção 7). Falta saber se o gNB roda no notebook **[A CONFIRMAR]**.
 - **Aceite:** OCUDU modificado compila na versão do testbed; com a opção desligada, o tráfego é bit a bit idêntico ao original; com ela ligada, os quadros são aceitos pelo gateway.
 
 ### F5 — EAP-TLS 1.3 pós-quântico (opcional, depois dos números; 5–8 dias)
@@ -124,5 +124,27 @@ Latência e jitter em números absolutos, comportamento do ArcOS (EAPOL de grupo
 
 - Aceitar GCM-AES-256 (PN 32 bits) na fase 1 e deixar XPN para depois?
 - Qual ponte de chaves na fase 1: CAK/CKN pelo nosso canal TLS PQC, ou outro canal PQC (por exemplo OpenSSH `mlkem768x25519-sha256`, como cita o documento)?
-- O Murilo tem emulador de RU para a F4?
+- ~~O Murilo tem emulador de RU para a F4?~~ Resolvido: há um `ru_emulator` no código do OCUDU (seção 7). Resta confirmar se o gNB roda no notebook e se a versão do OCUDU da testbed o inclui.
 - Versão exata do OCUDU/DPDK do testbed e política de imagem pública.
+
+## 7. Achados da leitura do OCUDU (21/11/2026) [CONFIRMADO: lido e compilado]
+
+Repositório `gitlab.com/ocudu/ocudu`, commit `698c4a5` (20/11/2026, versão 26.10.0). Clone em `~/opt/src/ocudu-src/repo`; build em `~/opt/src/ocudu-src/build`.
+
+**RU emulator.** `apps/examples/ofh/ru_emulator*`. Recebe C/U-Plane do DU, confere janelas T2a (DL C-Plane, UL C-Plane, DL U-Plane) e sequence ID, e responde ao C-Plane de uplink com U-Plane sintético (IQ e PRACH formatos 0 e B4). Configura-se por `ru_mac_addr`, `du_mac_addr`, `vlan_tag` (TCI inteiro), promiscuous, portas e compressão. Transceiver por socket (AF_PACKET) ou DPDK (`--eal_args`, aceita `--vdev`). Só filtra o EtherType eCPRI; não confere o MAC de destino, então funciona atrás do gateway (DA/SA preservados). O `lib/ru/dummy` **não serve**: é um RU dentro do DU, sem Ethernet.
+- Compilou, sem alterar código nem gerar avisos, contra a DPDK 26.07 (`-DENABLE_DPDK=ON`, GCC 16.2.1, yaml-cpp 0.9.0 compilado à parte; `ENABLE_WERROR=OFF`, `DISABLE_MBEDTLS`, `DISABLE_SCTP`). Teste de fumaça em `veth`: abre a interface e fica aguardando pacotes.
+- Sem privilégio de tempo real o worker de timing reclama de "woke up late": para as estatísticas on-time/early/late valerem, precisa de RT e núcleo isolado.
+- **Não valida a margem de uplink (~70 µs)**: não há modelagem de ta4/atraso; responde ao C-Plane de UL assim que o recebe [HIPÓTESE: o DU pode contá-las como "early"]. Valida correção do caminho e as janelas de DL.
+
+**Ganchos para a F4 (DPDK).**
+- **TX** `lib/ofh/ethernet/dpdk/dpdk_ethernet_transmitter.cpp`: `send()` aloca o mbuf, faz `memcpy` e chama `rte_eth_tx_burst`. O SecTAG pode entrar nesse `memcpy` (copiar DA/SA/VLAN, deixar 16 B, copiar o resto), com cryptodev em burst antes do `tx_burst`: sem cópia extra.
+- **RX** `dpdk_ethernet_receiver.cpp`: após `rte_eth_rx_burst`, cada mbuf passa por `rte_vlan_strip` **por software** e vai ao decoder, que assume quadro sem tag ("VLAN parameters are stripped by the NIC"). A verificação entra logo ali, em burst. Isso confirma a decisão da L2 (VLAN fora do AAD): com a tag dentro do protegido a verificação falharia.
+- `MAX_BURST_SIZE = 64`; builder em `vlan_ethernet_frame_builder_impl.cpp`.
+
+**Pontos de atenção.**
+1. mbuf de `MAX_ETH_FRAME_LENGTH (9600) + 14 + 4`: precisa de +32 B (SecTAG e ICV), e 9600 difere do limite de 9000 dos ToRs.
+2. O decoder descarta quadros < 64 B (`MIN_ETH_LEN`); depois de remover SecTAG e ICV um C-Plane curto pode cair abaixo disso. A conferir (FCS, re-padding).
+3. O receiver por socket filtra `ETH_P_ECPRI`: quadros `0x88E5` não chegam. Só o modo DPDK serve para a F4.
+4. [HIPÓTESE] filas do cryptodev não são thread-safe: TX e RX do OCUDU precisarão de filas distintas.
+5. Falta confirmar que o gNB roda no notebook (CPU e tempo real) com DPDK `--vdev`.
+

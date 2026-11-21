@@ -50,7 +50,7 @@ A cripto acrescenta ~1–3 µs (p50) e até ~6 µs (p99) por sentido a 8950 B. *
 - **Núcleo SecY (F1), itens do plano não feitos:** GCM-AES-256 com PN de 32 bits (só há XPN), SCI opcional (hoje sempre explícito, SecTAG de 16 B), vetores do 802.1AE Annex C. **Isso importa para a fase 1 do MKA**, se o KaY do hostap não suportar XPN.
 - **Gateway (F2):** run-to-completion, EAPOL→TAP e reescrita do DA de grupo. O gateway ainda usa o pipeline de 3 lcores com `rte_ring`.
 - **MKA (F3) e driver do hostap:** não iniciados. O `kernel-control.py` faz, para o kernel, o papel que o driver teria (mesmo protocolo de 96 B do gateway). A ponte CAK/CKN ainda não existe: o agente atual entrega chaves direcionais por EKM+HKDF, não CAK/CKN.
-- **SecY no OCUDU (F4):** não iniciada. O `INSTALL` do gateway **drena o pipeline** (bloqueante). Serve no gateway, **não na thread de TX do OCUDU**, que exigirá SA em slots duplos com troca atômica.
+- **SecY no OCUDU (F4):** não iniciada. Ganchos achados no código (commit `698c4a5`): no TX, o `send()` do transmitter DPDK já copia cada quadro para um mbuf antes do `tx_burst`, e o SecTAG entra nessa cópia; no RX, a verificação entra após o `rte_eth_rx_burst`, antes do `rte_vlan_strip` por software. Isso confirma a VLAN fora do AAD. Precisa de mbuf +32 B, atenção a quadros < 64 B após a verificação, e só o modo DPDK serve (o receiver por socket filtra `ETH_P_ECPRI`). Detalhes em `docs/plano-implementacao-testbed.md`, seção 7. O `INSTALL` do gateway **drena o pipeline** (bloqueante). Serve no gateway, **não na thread de TX do OCUDU**, que exigirá SA em slots duplos com troca atômica.
 - **Rekey:** é disparado por fora, executando o agente de novo (um handshake por rekey). Não há gatilho automático por limiar de PN ou tempo. O `RETIRE` foi testado só com carência de 2 s.
 - **E5 (replay, ICV adulterado, chave errada no gateway):** não executado. Só com autorização por escrito (Termo, item 8.7), quadros sintéticos e sem tocar nas O-RUs. A PKI é de laboratório.
 
@@ -59,13 +59,14 @@ A cripto acrescenta ~1–3 µs (p50) e até ~6 µs (p99) por sentido a 8950 B. *
 1. **Jitter/cauda.** `max` de centenas de µs em carga leve exige, na testbed: CPUs isoladas (`isolcpus`/`nohz_full`), governor `performance`, lcores em núcleos físicos distintos (sem irmãos de hyperthread) e NUMA-local.
 2. **IPsec-MB.** A série **3.0.x é incompatível** com o driver `ipsec_mb` do DPDK 26.07 (`IMB_MGR` opaco); usamos a 2.0.3. Qual versão a testbed tem?
 3. **Dependência da RNP:** VLANs 216x nos ToRs, MTU 9000, EAPOL em unicast, janela de experimento, imagem pública do OCUDU, escopo do Termo (gateway no oran-cloud5 e alteração do OCUDU).
-4. **Prazo.** Pelas estimativas do plano (não medidas): F3 4–6 dias, F4 7–10 dias (maior risco), F6 na janela da RNP. Janeiro é apertado para F0–F4 + F6.
+4. **O emulador de RU não mede a margem de uplink:** responde ao C-Plane de UL assim que o recebe, sem modelar ta4 (HIPÓTESE: o DU pode contar as respostas como "early"). Os ~70 µs só se validam com a RU real.
+5. **Prazo.** Pelas estimativas do plano (não medidas): F3 4–6 dias, F4 7–10 dias (maior risco), F6 na janela da RNP. Janeiro é apertado para F0–F4 + F6.
 
 ## 6. Decisões e pedidos (A DECIDIR / A CONFIRMAR)
 
 1. **Fase 1 do MKA:** aceitar GCM-AES-256 (PN 32 bits) com rekey antes de esgotar o PN e deixar XPN no KaY para depois, ou exigir XPN? O gateway e o kernel já falam XPN.
 2. **Ponte de chaves na fase 1:** CAK/CKN pelo nosso canal TLS PQC ou outro canal PQC (por exemplo, OpenSSH `mlkem768x25519-sha256`)?
-3. **Emulador de RU** para testar a F4 sem hardware: existe? Sem ele, a F4 fica validada só por testes de unidade e injeção contra o gateway.
+3. **Emulador de RU:** há um `ru_emulator` no código do OCUDU (`apps/examples/ofh`; compilado aqui contra a DPDK 26.07). A versão do OCUDU da testbed o inclui? Ele serve para a F4 sem hardware, mas **não valida a margem de uplink** (seção 4).
 4. **Versões exatas** do OCUDU, DPDK e IPsec-MB da testbed, e política de imagem pública (sem segredos).
 5. **Acesso:** `ROADMAP.md` e a branch `macsec_pqc`.
 6. **Experimentos prévios** sem MACsec, para medir o caminho real: E-1 (OCUDU direto) e E0 (gateway só com troca de VLAN), que separam o custo do salto extra do custo da cifra. E confirmar nos ToRs: EAPOL unicast, VLAN 2161–2163 e MTU 9000.
