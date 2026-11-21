@@ -124,6 +124,7 @@ struct app_stats {
     _Atomic uint64_t an_protected[MACSEC_AN_COUNT];
     _Atomic uint64_t an_unprotected[MACSEC_AN_COUNT];
     _Atomic uint64_t an_errors[MACSEC_AN_COUNT];
+    _Atomic uint64_t busy_cycles[3];   /* 0 = RX (main), 1 = crypto, 2 = TX: ciclos com trabalho */
     _Atomic uint64_t latency_hist[LATENCY_BUCKETS];
     _Atomic uint64_t latency_total_us;
     _Atomic uint64_t latency_jitter_total_us;
@@ -983,6 +984,7 @@ static int crypto_stage(void *argument)
         uint32_t frame_lens[BURST_SIZE] = {0};
         unsigned count;
         uint16_t request_count = 0;
+        uint64_t busy_start;
         unsigned i;
 
         count = rte_ring_dequeue_burst(pipeline->crypto_ring, (void **)jobs,
@@ -991,6 +993,7 @@ static int crypto_stage(void *argument)
             rte_pause();
             continue;
         }
+        busy_start = rte_rdtsc();
         atomic_store_explicit(&pipeline->worker_busy, true, memory_order_release);
         for (i = 0; i < count; i++) {
             uint8_t *frame;
@@ -1095,6 +1098,8 @@ static int crypto_stage(void *argument)
             finish_crypto_job(pipeline, jobs[i], result_lens[i], statuses[i]);
         }
         atomic_store_explicit(&pipeline->worker_busy, false, memory_order_release);
+        atomic_fetch_add_explicit(&pipeline->stats->busy_cycles[1],
+                                  rte_rdtsc() - busy_start, memory_order_relaxed);
     }
     return 0;
 }
@@ -1208,9 +1213,12 @@ static int tx_stage(void *argument)
             rte_pause();
             continue;
         }
+        uint64_t busy_start = rte_rdtsc();
         atomic_store_explicit(&pipeline->tx_busy, true, memory_order_release);
         transmit_stage(pipeline->plain_port, pipeline->secure_port, pipeline);
         atomic_store_explicit(&pipeline->tx_busy, false, memory_order_release);
+        atomic_fetch_add_explicit(&pipeline->stats->busy_cycles[2],
+                                  rte_rdtsc() - busy_start, memory_order_relaxed);
     }
     return 0;
 }
@@ -1575,9 +1583,14 @@ int main(int argc, char **argv)
                 printf("\nactivated rekey AN=%u\n", pending_an);
             }
         }
+        uint64_t rx_start = rte_rdtsc();
         received = receive_stage(config.plain_port, true, &pipeline);
         received = (uint16_t)(received +
                    receive_stage(config.secure_port, false, &pipeline));
+        if (received != 0U) {
+            atomic_fetch_add_explicit(&stats.busy_cycles[0], rte_rdtsc() - rx_start,
+                                      memory_order_relaxed);
+        }
         now = rte_get_timer_cycles();
         if (received != 0U) {
             had_input = true;
@@ -1613,6 +1626,13 @@ int main(int argc, char **argv)
                                               (double)runtime_us;
         printf("runtime_us=%" PRIu64 " processed=%" PRIu64 " pps=%.1f\n",
                runtime_us, processed, packets_per_second);
+        {
+            double total = (double)(rte_get_timer_cycles() - started_cycles);
+            printf("lcore_busy_pct rx=%.1f crypto=%.1f tx=%.1f\n",
+                   100.0 * (double)atomic_load_explicit(&stats.busy_cycles[0], memory_order_relaxed) / total,
+                   100.0 * (double)atomic_load_explicit(&stats.busy_cycles[1], memory_order_relaxed) / total,
+                   100.0 * (double)atomic_load_explicit(&stats.busy_cycles[2], memory_order_relaxed) / total);
+        }
         print_sa_stats(&stats);
         if (config.latency_stats) print_latency_stats(&stats);
     }

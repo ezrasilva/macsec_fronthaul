@@ -22,15 +22,16 @@ SUDOERS=${SUDOERS:-/etc/sudoers.d/macsec-testbed}
 mode=snapshot
 case "${1:-}" in --live) mode=live ;; --uninstall) rm -f "$SUDOERS"; rm -rf "$DEST"; echo "removido"; exit 0 ;; "") ;; *) echo "opcao invalida"; exit 2 ;; esac
 
-L1=l1-kernel-baseline.sh; L2=l2-interop.sh; L3=l3-netns.sh; L4=l4-rekey.sh
+L1=l1-kernel-baseline.sh; L2=l2-interop.sh; L3=l3-netns.sh; L4=l4-rekey.sh; L5=l5-bench.sh
 HELPERS="make-pki.sh kernel-control.py"
 if [ $mode = snapshot ]; then
   for f in "$repo/build/apps/dpdk/poc_macsec_dpdk" "$repo/build/tests/interop/interop_peer" "$repo/build/src/keying/poc_tls_keying" "$repo/build/src/keying/poc_keyctl" "$STAGE/lib/librte_eal.so" "$home/opt/local/lib/libIPSec_MB.so.2"; do
     [ -e "$f" ] || { echo "faltando: $f  (compile; rode scripts/testbed/build-dpdk-stage.sh)"; exit 1; }
   done
   # o binario precisa ter sido ligado ao DPDK 26.07 (mesma ABI do staging)
-  rm -rf "$DEST"; install -d -m 0755 -o root -g root "$DEST" "$DEST/scripts/testbed" "$DEST/build/apps/dpdk" "$DEST/build/tests/interop" "$DEST/build/src/keying" "$DEST/lib"
-  for s in $L1 $L2 $L3 $L4 $HELPERS; do install -m 0755 -o root -g root "$repo/scripts/testbed/$s" "$DEST/scripts/testbed/$s"; done
+  rm -rf "$DEST"; install -d -m 0755 -o root -g root "$DEST" "$DEST/scripts/testbed" "$DEST/build/apps/dpdk" "$DEST/build/tests/interop" "$DEST/build/src/keying" "$DEST/build/bin" "$DEST/lib"
+  for s in $L1 $L2 $L3 $L4 $L5 $HELPERS; do install -m 0755 -o root -g root "$repo/scripts/testbed/$s" "$DEST/scripts/testbed/$s"; done
+  install -m 0755 -o root -g root "$home/opt/local/bin/iperf3" "$DEST/build/bin/iperf3"
   install -m 0755 -o root -g root "$repo/build/src/keying/poc_tls_keying" "$repo/build/src/keying/poc_keyctl" "$DEST/build/src/keying/"
   install -m 0755 -o root -g root "$repo/build/apps/dpdk/poc_macsec_dpdk" "$DEST/build/apps/dpdk/"
   install -m 0755 -o root -g root "$repo/build/tests/interop/interop_peer" "$DEST/build/tests/interop/"
@@ -40,7 +41,7 @@ if [ $mode = snapshot ]; then
   bin=$DEST/scripts/testbed
 else
   install -d -m 0755 -o root -g root "$DEST/live"
-  for s in $L1 $L2 $L3 $L4; do
+  for s in $L1 $L2 $L3 $L4 $L5; do
     printf '#!/bin/sh\nexec %s/scripts/testbed/%s "$@"\n' "$repo" "$s" > "$DEST/live/$s"; chmod 0755 "$DEST/live/$s"
   done
   chown -R root:root "$DEST"; bin=$DEST/live
@@ -52,7 +53,7 @@ tmp=$(mktemp)
 {
   echo "# gerado por install-testbed.sh ($mode); remover: sudo install-testbed.sh --uninstall"
   printf '%s ALL=(root) NOPASSWD: ' "$user"
-  { rule $L1 '""' up test down; rule $L2 '""'; rule $L3 '""' e0 e1 all down; rule $L4 '""' run down; } | sed 's/, $//'
+  { rule $L1 '""' up test down; rule $L2 '""'; rule $L3 '""' e0 e1 all down; rule $L4 '""' run down; rule $L5 '""' run down; } | sed 's/, $//'
   echo
 } > "$tmp"
 visudo -cf "$tmp" >/dev/null || { echo "sudoers invalido:"; cat "$tmp"; rm -f "$tmp"; exit 1; }
