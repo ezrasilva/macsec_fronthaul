@@ -75,3 +75,33 @@ A cripto acrescenta ~1–3 µs (p50) e até ~6 µs (p99) por sentido a 8950 B. *
 ## 7. Como reproduzir
 
 Os scripts estão em `scripts/testbed/`. Sem root: `ninja -C build && meson test -C build`, `l2-pcap-regression.sh`, `l3-pcap-checks.sh`, `l4-local-check.sh` (precisa de `source ~/opt/env.sh` neste notebook). Com namespaces (root): `l1-kernel-baseline.sh`, `l2-interop.sh`, `l3-netns.sh`, `l4-rekey.sh`, `l5-bench.sh`. O `install-testbed.sh` instala uma cópia root-owned e uma regra `sudoers` restrita a esses scripts.
+
+## 8. Validação adicional — máquina Ubuntu 26.04 (23/11/2026)
+
+Repetimos toda a bateria de testes do projeto numa segunda máquina (Xeon Silver 4114, 8 CPUs, Ubuntu 26.04, kernel 7.0.0-34-generic), do zero, sem nada pré-instalado além do pacote `dpdk` do sistema (25.11.3, insuficiente). Commit validado: `c2237c3`. Esta máquina também tinha, em paralelo e o tempo todo **sem interrupção**, uma testbed OpenRAN separada rodando (core 5G `open5gs` em Docker + UERANSIM em `cu-ns`/`du-ns`/`ue-*`) — os dois ambientes não compartilham netns, portas nem dispositivos DPDK (o app usa `--no-pci --no-huge`), então coexistem sem conflito.
+
+**Ambiente construído (CONFIRMADO):** Intel IPsec-MB 2.0.3 e DPDK 26.07 compilados a partir do fonte (driver `crypto_aesni_gcm` confirmado presente), instalados em `~/opt/local` e `~/opt/stage`. `/opt/macsec-testbed` criado como link para o staging, para satisfazer o caminho padrão de plugins da EAL — **nota de segurança**: isso é um link para um diretório gravável pelo usuário, então enfraquece a garantia original do `install-testbed.sh` de que só o root altera o que roda como root; aceitável para validação local, não para a testbed real.
+
+**Achado de infraestrutura (CONFIRMADO):** o pacote `dpdk` 25.11.3 do Ubuntu instala bibliotecas com o mesmo SONAME principal (`.26`) da nossa DPDK 26.07 (ABI diferente, `26.0` vs `26.2`). Se o `LD_LIBRARY_PATH` não priorizar explicitamente os caminhos da nossa build, a resolução de dependências de um plugin carregado pela EAL (ex.: `net_af_packet` → `librte_bus_pci`) pode puxar a cópia do sistema enquanto a EAL carrega explicitamente a nossa cópia do diretório de plugins — duas instâncias físicas distintas do mesmo módulo, causando `PANIC` por registro duplicado de tailq (`UIO_RESOURCE_LIST`). Resolvido fixando `LD_LIBRARY_PATH` com os caminhos da nossa build na frente de qualquer outro. **Vale verificar se a testbed real tem DPDK do sistema instalada; se tiver, o mesmo cuidado se aplica.**
+
+**Resultados (CONFIRMADO, todos no commit `c2237c3`):**
+
+| Teste | Resultado |
+|---|---|
+| Testes unitários (`meson test`) | 3/3 OK |
+| `l1-kernel-baseline` | OK, 0% perda |
+| `l2-interop` (SecY ↔ MACsec do kernel) | OK, interop nos dois sentidos |
+| `l2-pcap-regression` / `l3-pcap-checks` | OK |
+| `l3-netns e0` (VLAN, sem cripto) | OK, 0% perda 72–8950 B |
+| `l3-netns e1` (MACsec GCM-AES-XPN-256) | OK, 0% perda 72–8950 B, 8951 B descartado como esperado |
+| `l4-rekey` (TLS 1.3 X25519MLKEM768+ML-DSA-65, 3 rekeys sob ping contínuo) | OK, 0% perda, `InPktsInvalid=0` no kernel |
+| `l5-bench` | Concluído; vazão E1/E0 na faixa 0.56–1.04 dependendo de tamanho/sentido, latência de software e0 p50 2–8 µs / e1 p50 3–8 µs sob carga leve — **mesma ressalva da seção 3: não é piso de desempenho do fronthaul físico** |
+| `ocudu-smoke` (gNB real `gnb_split_7_2` ↔ `ru_emulator`, commit OCUDU `698c4a5` + patch SecY) | Funcional (E1 Setup completo, sem crash); KPIs de timing inconclusivos sem prioridade RT (sem root) |
+| `e0-ocudu` (gateway, gNB real) | Funcional, **0 corrupção / 0 descarte / 0 erro de sequência**; timing com atraso alto (DL U-Plane 26.6% on-time) — mesma limitação de ambiente sem RT |
+| `e1-ocudu` (SecY dentro do gNB) | **3 rodadas, todas com `auth=0 replay=0`** — o defeito intermitente já documentado (~84% de falha de autenticação, seção descrição do `ocudu/README.md`) **não se manifestou em nenhuma das 3 execuções**. Não é prova de correção (o defeito é intermitente por natureza), mas é evidência a favor. |
+
+**Bugs de script corrigidos durante a validação (CONFIRMADO, não requerem decisão, só registro):**
+- `l5-bench.sh`: default `CLI_CPU=8` é inválido em máquinas com 8 CPUs (0–7); `taskset` falhava silenciosamente e zerava todo o tráfego do cliente. Contornado passando `CLI_CPU=7` via variável de ambiente; vale corrigir o default no script.
+- `e0-ocudu.sh` / `e1-ocudu.sh`: `taskset -c 9-11` (RU) e `taskset -c 5-8` (DU) hardcoded assumem ≥12 CPUs; em máquina de 8 CPUs ambos os `taskset` falham e nada roda. Contornado com uma cópia local ajustada (`6-7` e `1,3,5`); os scripts originais no repositório não foram alterados.
+
+**Bloqueio de ambiente (A CONFIRMAR na testbed):** os scripts `*-ocudu.sh` usam `unshare -Urmnpf` (user namespace sem privilégio). No Ubuntu 26.04 isso é bloqueado por padrão (`kernel.apparmor_restrict_unprivileged_userns=1`, AppArmor). Precisou de `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` (não persistente, revertido ao final dos testes) para rodar. **Se a testbed física também for Ubuntu 24.04+/26.04 com AppArmor, o mesmo ajuste será necessário**, ou os scripts precisam de outro caminho de execução (ex.: dentro de um namespace já privilegiado).
