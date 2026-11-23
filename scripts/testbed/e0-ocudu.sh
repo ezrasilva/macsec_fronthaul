@@ -4,6 +4,10 @@
 # Namespaces como processos dentro de um user namespace (ver comentarios). Precisa de: source ~/opt/env.sh
 # Uso: scripts/testbed/e0-ocudu.sh [direct|gateway] [segundos]     Variaveis: BLACK(2161) RED(161) BW(20)
 set -euo pipefail
+# nao empilhar execucoes: sobras de uma rodada anterior consomem 1-2 GB de RAM cada
+if pgrep -x gnb >/dev/null || pgrep -x poc_macsec_dpdk >/dev/null || pgrep -x ru_emulator >/dev/null; then
+  echo "ja existe gnb/poc_macsec_dpdk/ru_emulator rodando; encerre antes (pkill -x gnb; pkill -x poc_macsec_dpdk; pkill -x ru_emulator)" >&2; exit 1
+fi
 here=$(cd "$(dirname "$0")" && pwd); root=$(cd "$here/../.." && pwd)
 MODE=${1:-gateway}; SECS=${2:-30}
 OCUDU=${OCUDU:-$HOME/opt/src/ocudu-src/build}; APP=${APP:-$root/build/apps/dpdk/poc_macsec_dpdk}
@@ -76,7 +80,12 @@ fs=$(( (MTU + 200 + 255) / 256 * 256 )); bs=$(( fs * 16 ))
 af() { echo "--vdev=net_af_packet$1,iface=$2,blocksz=$bs,framesz=$fs,framecnt=$(( 16 * 32 )),qdisc_bypass=1"; }
 export W OCUDU APP MODE SECS BLACK RED MTU
 export AFA="$(af 0 gwr)" AFB="$(af 1 gwb)"
-unshare -Urmn bash -c '
+# PID ns (-p -f): quando o bash interno sai por QUALQUER motivo, o kernel mata tudo dentro; --kill-child cobre morte do pai.
+# O bash interno e o init do PID ns e ignora SIGTERM/SIGINT; por isso o trap abaixo mata o unshare com SIGKILL
+# (Ctrl-C, timeout, kill do script) e o kernel derruba o namespace inteiro. timeout -s KILL limita o tempo total.
+UP=
+trap '[ -n "$UP" ] && { pkill -9 -P $UP; kill -9 $UP; } 2>/dev/null || true' EXIT INT TERM
+timeout -s KILL $((SECS + 120)) unshare -Urmnpf --kill-child --mount-proc bash -c '
   set -e; mount -t tmpfs tmpfs /run; ip link set lo up
   unshare -n sleep $((SECS + 60)) & DU=$!
   unshare -n sleep $((SECS + 60)) & RU=$!
@@ -106,7 +115,8 @@ unshare -Urmn bash -c '
   [ -n "${GP:-}" ] && { kill -INT $GP 2>/dev/null || true; sleep 1; }
   kill -INT $EP 2>/dev/null || true; sleep 1
   kill -9 $GN ${GP:-} $EP 2>/dev/null || true
-' || true
+' & UP=$!
+wait $UP || echo "AVISO: o namespace terminou com erro/timeout (processos internos ja foram encerrados)" >&2
 
 python3 -I - "$W" "$MODE" <<'PY'
 import re, sys

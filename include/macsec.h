@@ -131,6 +131,15 @@ enum macsec_status macsec_prepare_protect_direct(
     size_t frame_capacity, size_t *secure_len,
     struct macsec_crypto_request *request);
 
+/* Como o _direct, mas SEM estado: o PN (nao zero) ja foi reservado pelo chamador
+ * (por exemplo, com um fetch_add atomico) e a SA nao e modificada. Permite varias
+ * threads de TX usarem a mesma SA. A recepcao continua exigindo uma unica thread
+ * por SA (a janela anti-replay e estado mutavel). */
+enum macsec_status macsec_prepare_protect_direct_pn(
+    const struct macsec_tx_sa *sa, uint64_t pn, uint8_t *frame, size_t l2,
+    size_t plain_len, size_t frame_capacity, size_t *secure_len,
+    struct macsec_crypto_request *request);
+
 enum macsec_status macsec_prepare_unprotect_in_place(
     struct macsec_rx_sa *sa, uint8_t *frame, size_t secure_len,
     size_t *plain_len, struct macsec_crypto_request *request);

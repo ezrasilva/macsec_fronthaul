@@ -1,6 +1,19 @@
 #include "key_control.h"
 
+#ifndef MACSEC_NO_OPENSSL
 #include <openssl/crypto.h>
+#define KC_CLEANSE(p, n) OPENSSL_cleanse((p), (n))
+#else
+/* escrita via ponteiro volatil: o otimizador nao pode remover (explicit_bzero
+ * exigiria _DEFAULT_SOURCE em C estrito) */
+#include <stddef.h>
+static void kc_cleanse(void *p, size_t n)
+{
+    volatile unsigned char *v = (volatile unsigned char *)p;
+    while (n-- != 0U) *v++ = 0U;
+}
+#define KC_CLEANSE(p, n) kc_cleanse((p), (n))
+#endif
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
@@ -189,10 +202,10 @@ bool key_control_decode(const struct key_control_wire_message *wire,
 
 void key_control_clear(struct key_control_command *command)
 {
-    if (command != NULL) OPENSSL_cleanse(command, sizeof(*command));
+    if (command != NULL) KC_CLEANSE(command, sizeof(*command));
 }
 
 void key_control_wire_clear(struct key_control_wire_message *wire)
 {
-    if (wire != NULL) OPENSSL_cleanse(wire, sizeof(*wire));
+    if (wire != NULL) KC_CLEANSE(wire, sizeof(*wire));
 }

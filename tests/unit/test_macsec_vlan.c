@@ -139,6 +139,27 @@ static void test_in_place_and_direct_match_copy(void)
     assert(l2 == ref_len && memcmp(dir, ref, ref_len) == 0);
 }
 
+static void test_stateless_pn_variant(void)
+{
+    struct macsec_tx_sa t_ref, t_sa;
+    struct macsec_crypto_request req;
+    uint8_t ref[256], dir[256];
+    size_t ref_len = 0, len = 0;
+
+    tx_ab(&t_ref, 0x1234); tx_ab(&t_sa, 1);              /* PN da SA ignorado: usa o passado */
+    assert(macsec_protect(&t_ref, vlan_frame, sizeof(vlan_frame), ref, sizeof(ref), &ref_len) == MACSEC_OK);
+    memset(dir, 0, sizeof(dir));
+    memcpy(dir, vlan_frame, 16);
+    memcpy(dir + 32, vlan_frame + 16, sizeof(vlan_frame) - 16);
+    assert(macsec_prepare_protect_direct_pn(&t_sa, 0x1234, dir, 16, sizeof(vlan_frame), sizeof(dir), &len, &req) == MACSEC_OK);
+    run_encrypt(&req);
+    assert(len == ref_len && memcmp(dir, ref, ref_len) == 0);
+    assert(t_sa.next_pn == 1U);                           /* a SA nao foi modificada */
+    assert(macsec_prepare_protect_direct_pn(&t_sa, 0, dir, 16, sizeof(vlan_frame), sizeof(dir), &len, &req) == MACSEC_ERR_PN_EXHAUSTED);
+    assert(macsec_prepare_protect_direct_pn(&t_sa, 1, dir, 16, sizeof(vlan_frame), sizeof(vlan_frame) + 31, &len, &req) == MACSEC_ERR_CAPACITY);
+    assert(macsec_prepare_protect_direct_pn(&t_sa, 1, dir, 13, sizeof(vlan_frame), sizeof(dir), &len, &req) == MACSEC_ERR_ARGUMENT);
+}
+
 static void test_negatives(void)
 {
     struct macsec_tx_sa tx;
@@ -234,6 +255,7 @@ int main(void)
     test_layout_and_aad();
     test_vlan_swap_keeps_icv_valid();
     test_in_place_and_direct_match_copy();
+    test_stateless_pn_variant();
     test_negatives();
     test_without_vlan_and_qinq();
     test_short_frame_sl();

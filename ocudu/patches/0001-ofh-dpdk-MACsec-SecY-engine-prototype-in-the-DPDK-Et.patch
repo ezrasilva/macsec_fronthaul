@@ -1,0 +1,1994 @@
+From 95e599c8f54b66defa47b57b0f3b7e119110e0c7 Mon Sep 17 00:00:00 2001
+From: Esdras Silva <esdrasdev0@gmail.com>
+Date: Mon, 23 Nov 2026 06:59:41 -0300
+Subject: [PATCH] ofh/dpdk: MACsec SecY engine (prototype) in the DPDK Ethernet
+ transmitter/receiver
+
+TX: SecTAG inserted during the copy into the mbuf, ICV appended, AES-256-GCM-XPN in a
+DPDK cryptodev burst. RX: verified in place after rte_eth_rx_burst, before rte_vlan_strip.
+SAs in 4 slots with epoch-based retirement; PN reserved atomically; control socket thread
+(INSTALL/ACTIVATE/RETIRE/STATUS). Enabled with OCUDU_MACSEC=1 (environment); disabled
+leaves the data path unchanged. Port MTU grows by 32 B and the mbuf pool is sized for it.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ .../dpdk/dpdk_ethernet_port_context.h         |   9 +
+ lib/ofh/ethernet/dpdk/CMakeLists.txt          |   9 +-
+ .../dpdk/dpdk_ethernet_port_context.cpp       |  18 +-
+ .../ethernet/dpdk/dpdk_ethernet_receiver.cpp  |   6 +
+ .../dpdk/dpdk_ethernet_transmitter.cpp        |  21 +
+ .../ethernet/dpdk/macsec/macsec_engine.cpp    | 597 ++++++++++++++++++
+ lib/ofh/ethernet/dpdk/macsec/macsec_engine.h  | 148 +++++
+ .../dpdk/macsec/secy_core/key_control.c       | 211 +++++++
+ .../dpdk/macsec/secy_core/key_control.h       |  51 ++
+ .../ethernet/dpdk/macsec/secy_core/macsec.c   | 596 +++++++++++++++++
+ .../ethernet/dpdk/macsec/secy_core/macsec.h   | 153 +++++
+ 11 files changed, 1815 insertions(+), 4 deletions(-)
+ create mode 100644 lib/ofh/ethernet/dpdk/macsec/macsec_engine.cpp
+ create mode 100644 lib/ofh/ethernet/dpdk/macsec/macsec_engine.h
+ create mode 100644 lib/ofh/ethernet/dpdk/macsec/secy_core/key_control.c
+ create mode 100644 lib/ofh/ethernet/dpdk/macsec/secy_core/key_control.h
+ create mode 100644 lib/ofh/ethernet/dpdk/macsec/secy_core/macsec.c
+ create mode 100644 lib/ofh/ethernet/dpdk/macsec/secy_core/macsec.h
+
+diff --git a/include/ocudu/ofh/ethernet/dpdk/dpdk_ethernet_port_context.h b/include/ocudu/ofh/ethernet/dpdk/dpdk_ethernet_port_context.h
+index 10cc1a0..866ea60 100644
+--- a/include/ocudu/ofh/ethernet/dpdk/dpdk_ethernet_port_context.h
++++ b/include/ocudu/ofh/ethernet/dpdk/dpdk_ethernet_port_context.h
+@@ -12,6 +12,8 @@ struct rte_mempool;
+ namespace ocudu {
+ namespace ether {
+ 
++class macsec_engine;
++
+ /// DPDK configuration settings.
+ constexpr unsigned MAX_BURST_SIZE = 64;
+ 
+@@ -55,10 +57,17 @@ public:
+   /// Returns the mbuf memory pool of this context.
+   const ::rte_mempool* get_mempool() const { return mem_pool.get(); }
+ 
++  /// Returns the MACsec engine of this port, or nullptr when MACsec is disabled (OCUDU_MACSEC is not set).
++  macsec_engine* get_macsec() { return macsec.get(); }
++
++  /// Sets the MACsec engine of this port.
++  void set_macsec(std::shared_ptr<macsec_engine> engine) { macsec = std::move(engine); }
++
+ private:
+   const std::string                    port_id;
+   const unsigned                       dpdk_port_id;
+   const std::shared_ptr<::rte_mempool> mem_pool;
++  std::shared_ptr<macsec_engine>       macsec;
+ };
+ 
+ } // namespace ether
+diff --git a/lib/ofh/ethernet/dpdk/CMakeLists.txt b/lib/ofh/ethernet/dpdk/CMakeLists.txt
+index b8fda47..b669ad3 100644
+--- a/lib/ofh/ethernet/dpdk/CMakeLists.txt
++++ b/lib/ofh/ethernet/dpdk/CMakeLists.txt
+@@ -7,8 +7,15 @@ set(SOURCES
+         dpdk_ethernet_port_context.cpp
+         dpdk_ethernet_transmitter.cpp
+         dpdk_ethernet_factories.cpp
+-        dpdk_ethernet_receiver.cpp)
++        dpdk_ethernet_receiver.cpp
++        macsec/macsec_engine.cpp
++        macsec/secy_core/macsec.c
++        macsec/secy_core/key_control.c)
+ 
+ add_library(ocudu_ofh_dpdk_ethernet STATIC ${SOURCES})
+ target_compile_options(ocudu_ofh_dpdk_ethernet PRIVATE ${DPDK_CFLAGS})
++# MACsec SecY core (C, no OpenSSL: AES-GCM runs in a DPDK cryptodev).
++target_compile_definitions(ocudu_ofh_dpdk_ethernet PRIVATE MACSEC_NO_OPENSSL)
++target_include_directories(ocudu_ofh_dpdk_ethernet PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/macsec)
++set_source_files_properties(macsec/secy_core/macsec.c macsec/secy_core/key_control.c PROPERTIES COMPILE_FLAGS "-std=c11 -Wno-error")
+ target_link_libraries(ocudu_ofh_dpdk_ethernet ocudulog ocudu_instrumentation ${DPDK_LIBRARIES})
+diff --git a/lib/ofh/ethernet/dpdk/dpdk_ethernet_port_context.cpp b/lib/ofh/ethernet/dpdk/dpdk_ethernet_port_context.cpp
+index e314fa7..23fb03e 100644
+--- a/lib/ofh/ethernet/dpdk/dpdk_ethernet_port_context.cpp
++++ b/lib/ofh/ethernet/dpdk/dpdk_ethernet_port_context.cpp
+@@ -3,6 +3,7 @@
+ // SPDX-License-Identifier: BSD-3-Clause-Open-MPI
+ 
+ #include "ocudu/ofh/ethernet/dpdk/dpdk_ethernet_port_context.h"
++#include "macsec/macsec_engine.h"
+ #include "ocudu/ofh/ethernet/ethernet_properties.h"
+ #include <charconv>
+ #include <memory>
+@@ -18,7 +19,9 @@ static constexpr unsigned RX_RING_SIZE    = 1024;
+ static constexpr unsigned TX_RING_SIZE    = 1024;
+ static constexpr unsigned NUM_MBUFS       = 9216;
+ /// Size of the mbuf data buffers. It fits the largest frame, with the Ethernet header and a VLAN tag.
+-static constexpr unsigned MAX_BUFFER_SIZE = MAX_ETH_FRAME_LENGTH + RTE_ETHER_HDR_LEN + RTE_VLAN_HLEN;
++// Room for the MACsec SecTAG and ICV (32 bytes) is always reserved: it costs nothing when MACsec is disabled.
++static constexpr unsigned MAX_BUFFER_SIZE =
++    MAX_ETH_FRAME_LENGTH + RTE_ETHER_HDR_LEN + RTE_VLAN_HLEN + macsec_engine::FRAME_OVERHEAD;
+ 
+ /// DPDK port initialization routine.
+ static bool port_init(const dpdk_port_config& config, ::rte_mempool* mem_pool, unsigned port_id)
+@@ -182,8 +185,15 @@ std::shared_ptr<dpdk_port_context> dpdk_port_context::create(const dpdk_port_con
+ 
+   uint16_t dpdk_port_id = *opt_port_id;
+ 
++  // MACsec (optional, OCUDU_MACSEC=1): frames grow by SecTAG and ICV, so the port MTU grows too.
++  std::shared_ptr<macsec_engine> macsec_ctx = macsec_engine::create_from_env();
++  dpdk_port_config               port_config = config;
++  if (macsec_ctx) {
++    port_config.mtu_size = units::bytes(config.mtu_size.value() + macsec_engine::FRAME_OVERHEAD);
++  }
++
+   auto mem_pool = create_mem_pool(dpdk_port_id);
+-  if (!port_init(config, mem_pool.get(), dpdk_port_id)) {
++  if (!port_init(port_config, mem_pool.get(), dpdk_port_id)) {
+     ::rte_exit(EXIT_FAILURE, "DPDK - Unable to initialize Ethernet port '%u'\n", dpdk_port_id);
+   }
+ 
+@@ -191,7 +201,9 @@ std::shared_ptr<dpdk_port_context> dpdk_port_context::create(const dpdk_port_con
+     print_link_status(dpdk_port_id);
+   }
+ 
+-  return std::shared_ptr<dpdk_port_context>(new dpdk_port_context(config.id, dpdk_port_id, std::move(mem_pool)));
++  auto ctx = std::shared_ptr<dpdk_port_context>(new dpdk_port_context(config.id, dpdk_port_id, std::move(mem_pool)));
++  ctx->set_macsec(std::move(macsec_ctx));
++  return ctx;
+ }
+ 
+ dpdk_port_context::~dpdk_port_context()
+diff --git a/lib/ofh/ethernet/dpdk/dpdk_ethernet_receiver.cpp b/lib/ofh/ethernet/dpdk/dpdk_ethernet_receiver.cpp
+index 57ca2c9..3b5e90e 100644
+--- a/lib/ofh/ethernet/dpdk/dpdk_ethernet_receiver.cpp
++++ b/lib/ofh/ethernet/dpdk/dpdk_ethernet_receiver.cpp
+@@ -3,6 +3,7 @@
+ // SPDX-License-Identifier: BSD-3-Clause-Open-MPI
+ 
+ #include "dpdk_ethernet_receiver.h"
++#include "macsec/macsec_engine.h"
+ #include "ocudu/instrumentation/traces/ofh_traces.h"
+ #include "ocudu/ofh/ethernet/dpdk/dpdk_ethernet_rx_buffer.h"
+ #include "ocudu/ofh/ethernet/ethernet_frame_notifier.h"
+@@ -108,6 +109,11 @@ void dpdk_receiver_impl::receive()
+     metrics_collector.update_stats(meas.stop(), nof_bytes_received, num_frames);
+   }
+ 
++  if (macsec_engine* macsec = port_ctx->get_macsec()) {
++    // MACsec: verify and strip SecTAG/ICV in place; frames that fail (or are not MACsec) are dropped and freed.
++    num_frames = macsec->verify_burst(mbufs.data(), num_frames);
++  }
++
+   for (auto* mbuf : span<::rte_mbuf*>(mbufs.data(), num_frames)) {
+     ::rte_vlan_strip(mbuf);
+     notifier->on_new_frame(unique_rx_buffer(dpdk_rx_buffer_impl(mbuf)));
+diff --git a/lib/ofh/ethernet/dpdk/dpdk_ethernet_transmitter.cpp b/lib/ofh/ethernet/dpdk/dpdk_ethernet_transmitter.cpp
+index 3228adf..bfd0212 100644
+--- a/lib/ofh/ethernet/dpdk/dpdk_ethernet_transmitter.cpp
++++ b/lib/ofh/ethernet/dpdk/dpdk_ethernet_transmitter.cpp
+@@ -3,6 +3,7 @@
+ // SPDX-License-Identifier: BSD-3-Clause-Open-MPI
+ 
+ #include "dpdk_ethernet_transmitter.h"
++#include "macsec/macsec_engine.h"
+ #include "ocudu/adt/static_vector.h"
+ #include "ocudu/ofh/ethernet/ethernet_transmitter_config.h"
+ #include <rte_ethdev.h>
+@@ -30,6 +31,26 @@ void dpdk_transmitter_impl::send(span<span<const uint8_t>> frames)
+     }
+ 
+     uint64_t nof_bytes_in_burst = 0;
++    if (macsec_engine* macsec = port_ctx->get_macsec()) {
++      // MACsec: the engine fills the mbufs (SecTAG inserted during the copy) and runs the cryptodev burst. Frames that
++      // cannot be protected (no active SA, ...) are dropped and freed by the engine.
++      const unsigned nof_protected = macsec->protect_burst(mbufs.data(), frame_burst);
++      for (unsigned idx = 0; idx != nof_protected; ++idx) {
++        nof_bytes_in_burst += mbufs[idx]->pkt_len;
++      }
++      unsigned sent = nof_protected == 0
++                          ? 0
++                          : ::rte_eth_tx_burst(port_ctx->get_dpdk_port_id(), 0, mbufs.data(), nof_protected);
++      for (unsigned i = sent; i < nof_protected; ++i) {
++        ::rte_pktmbuf_free(mbufs[i]);
++      }
++      if (OCUDU_UNLIKELY(sent < nof_protected)) {
++        logger.warning("DPDK dropped '{}' MACsec packets out of '{}' in the tx burst to the NIC port '{}'",
++                       nof_protected - sent, nof_protected, port_ctx->get_port_id());
++      }
++      metrics_collector.update_stats(meas.stop(), nof_bytes_in_burst, sent);
++      continue;
++    }
+     for (unsigned idx = 0, end = frame_burst.size(); idx != end; ++idx) {
+       const auto  frame = frame_burst[idx];
+       ::rte_mbuf* mbuf  = mbufs[idx];
+diff --git a/lib/ofh/ethernet/dpdk/macsec/macsec_engine.cpp b/lib/ofh/ethernet/dpdk/macsec/macsec_engine.cpp
+new file mode 100644
+index 0000000..05cd35a
+--- /dev/null
++++ b/lib/ofh/ethernet/dpdk/macsec/macsec_engine.cpp
+@@ -0,0 +1,597 @@
++// SPDX-License-Identifier: BSD-3-Clause-Open-MPI
++//
++// MACsec SecY for the OCUDU DPDK Ethernet transmitter/receiver (prototype, PoC MACsec-PQC). See macsec_engine.h.
++
++#include "macsec_engine.h"
++#include <cerrno>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <fmt/format.h>
++#include <poll.h>
++#include <rte_crypto.h>
++#include <rte_crypto_sym.h>
++#include <rte_cryptodev.h>
++#include <rte_cycles.h>
++#include <rte_eal.h>
++#include <rte_mbuf.h>
++#include <rte_pause.h>
++#include <sys/socket.h>
++#include <sys/stat.h>
++#include <sys/un.h>
++#include <unistd.h>
++
++using namespace ocudu;
++using namespace ether;
++
++namespace {
++
++constexpr unsigned CRYPTO_OPS         = 2048;
++constexpr unsigned CRYPTO_IV_OFFSET   = sizeof(struct rte_crypto_op) + sizeof(struct rte_crypto_sym_op);
++constexpr unsigned CRYPTO_AAD_OFFSET  = CRYPTO_IV_OFFSET + 16U;
++constexpr unsigned CRYPTO_INDEX_OFFSET = CRYPTO_AAD_OFFSET + 32U;
++constexpr unsigned CRYPTO_PRIVATE_SIZE = 16U + 32U + 8U;
++constexpr uint64_t CRYPTO_TIMEOUT_US  = 5000;
++
++void secure_zero(void* p, size_t n)
++{
++  volatile unsigned char* v = static_cast<volatile unsigned char*>(p);
++  while (n-- != 0U) {
++    *v++ = 0U;
++  }
++}
++
++bool parse_hex(const char* text, uint8_t* out, size_t out_len)
++{
++  if (text == nullptr || strlen(text) != out_len * 2U) {
++    return false;
++  }
++  for (size_t i = 0; i != out_len; ++i) {
++    unsigned value = 0;
++    if (sscanf(text + 2 * i, "%2x", &value) != 1) {
++      return false;
++    }
++    out[i] = static_cast<uint8_t>(value);
++  }
++  return true;
++}
++
++/// Marks the thread as being inside a burst for the duration of the scope.
++struct epoch_guard {
++  std::atomic<uint64_t>& value;
++  explicit epoch_guard(std::atomic<uint64_t>& value_) : value(value_) { value.fetch_add(1, std::memory_order_seq_cst); }
++  ~epoch_guard() { value.fetch_add(1, std::memory_order_seq_cst); }
++};
++
++} // namespace
++
++bool macsec_engine::is_enabled_in_env()
++{
++  const char* enable = getenv("OCUDU_MACSEC");
++  return enable != nullptr && strcmp(enable, "1") == 0;
++}
++
++std::unique_ptr<macsec_engine> macsec_engine::create_from_env()
++{
++  if (!is_enabled_in_env()) {
++    return nullptr;
++  }
++  config      cfg;
++  const char* socket_path = getenv("OCUDU_MACSEC_CONTROL_SOCKET");
++  if (socket_path == nullptr || socket_path[0] == '\0' ||
++      !parse_hex(getenv("OCUDU_MACSEC_TX_SCI"), cfg.tx_sci, sizeof(cfg.tx_sci)) ||
++      !parse_hex(getenv("OCUDU_MACSEC_RX_SCI"), cfg.rx_sci, sizeof(cfg.rx_sci))) {
++    ::rte_exit(EXIT_FAILURE,
++               "MACsec - OCUDU_MACSEC=1 requires OCUDU_MACSEC_CONTROL_SOCKET and OCUDU_MACSEC_TX_SCI / "
++               "OCUDU_MACSEC_RX_SCI (16 hexadecimal characters each)\n");
++  }
++  cfg.control_socket = socket_path;
++  if (const char* v = getenv("OCUDU_MACSEC_TX_SSCI")) {
++    cfg.tx_ssci = static_cast<uint32_t>(strtoul(v, nullptr, 0));
++  }
++  if (const char* v = getenv("OCUDU_MACSEC_RX_SSCI")) {
++    cfg.rx_ssci = static_cast<uint32_t>(strtoul(v, nullptr, 0));
++  }
++  if (const char* v = getenv("OCUDU_MACSEC_REPLAY_WINDOW")) {
++    unsigned w = static_cast<unsigned>(strtoul(v, nullptr, 0));
++    if (w >= 1 && w <= MACSEC_MAX_REPLAY_WINDOW) {
++      cfg.replay_window = static_cast<uint8_t>(w);
++    }
++  }
++  return std::unique_ptr<macsec_engine>(new macsec_engine(cfg));
++}
++
++macsec_engine::macsec_engine(const config& cfg_) : cfg(cfg_)
++{
++  if (!init_cryptodev()) {
++    ::rte_exit(EXIT_FAILURE,
++               "MACsec - no usable DPDK cryptodev. Add --vdev=crypto_aesni_gcm0 (or a hardware device) to the "
++               "DPDK EAL arguments\n");
++  }
++  listener = ::socket(AF_UNIX, SOCK_SEQPACKET, 0);
++  struct sockaddr_un address = {};
++  address.sun_family         = AF_UNIX;
++  if (listener < 0 || cfg.control_socket.size() >= sizeof(address.sun_path)) {
++    ::rte_exit(EXIT_FAILURE, "MACsec - cannot create the control socket\n");
++  }
++  ::unlink(cfg.control_socket.c_str());
++  memcpy(address.sun_path, cfg.control_socket.c_str(), cfg.control_socket.size() + 1U);
++  if (::bind(listener, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) != 0 ||
++      ::chmod(cfg.control_socket.c_str(), S_IRUSR | S_IWUSR) != 0 || ::listen(listener, 4) != 0) {
++    ::rte_exit(EXIT_FAILURE, "MACsec - cannot bind the control socket '%s': %s\n", cfg.control_socket.c_str(),
++               strerror(errno));
++  }
++  fmt::print("MACsec - enabled: cryptodev {}, control socket '{}' (no SA yet: nothing is transmitted)\n",
++             crypto_dev_id, cfg.control_socket);
++  control_thread = std::thread([this]() { control_loop(); });
++}
++
++macsec_engine::~macsec_engine()
++{
++  stop.store(true);
++  if (control_thread.joinable()) {
++    control_thread.join();
++  }
++  if (listener >= 0) {
++    ::close(listener);
++    ::unlink(cfg.control_socket.c_str());
++  }
++  for (auto& s : slots) {
++    s.valid.store(false);
++    free_session(s.tx_session);
++    free_session(s.rx_session);
++    secure_zero(&s.tx, sizeof(s.tx));
++    secure_zero(&s.rx, sizeof(s.rx));
++  }
++  const auto st = get_stats();
++  fmt::print("MACsec - tx_ok={} tx_drop_no_sa={} tx_drop_other={} rx_ok={} rx_drop: not_macsec={} no_sa={} auth={} "
++             "replay={} format={} rekeys={}\n",
++             st.tx_ok, st.tx_dropped_not_ready, st.tx_dropped_other, st.rx_ok, st.rx_dropped_not_macsec,
++             st.rx_dropped_no_sa, st.rx_dropped_auth, st.rx_dropped_replay, st.rx_dropped_format, st.rekeys);
++}
++
++macsec_engine_stats macsec_engine::get_stats() const
++{
++  macsec_engine_stats s;
++  s.tx_ok                = stats.tx_ok.load();
++  s.tx_dropped_not_ready = stats.tx_dropped_not_ready.load();
++  s.tx_dropped_other     = stats.tx_dropped_other.load();
++  s.rx_ok                = stats.rx_ok.load();
++  s.rx_dropped_not_macsec = stats.rx_dropped_not_macsec.load();
++  s.rx_dropped_no_sa     = stats.rx_dropped_no_sa.load();
++  s.rx_dropped_auth      = stats.rx_dropped_auth.load();
++  s.rx_dropped_replay    = stats.rx_dropped_replay.load();
++  s.rx_dropped_format    = stats.rx_dropped_format.load();
++  s.rekeys               = stats.rekeys.load();
++  return s;
++}
++
++bool macsec_engine::init_cryptodev()
++{
++  if (::rte_cryptodev_count() == 0U) {
++    return false;
++  }
++  crypto_dev_id = 0;
++  struct rte_cryptodev_info info;
++  ::rte_cryptodev_info_get(crypto_dev_id, &info);
++  const unsigned nof_qps = std::min<unsigned>(MAX_THREADS, info.max_nb_queue_pairs);
++  if (nof_qps == 0U) {
++    return false;
++  }
++  struct rte_cryptodev_config dev_config = {};
++  dev_config.socket_id                   = static_cast<int>(::rte_socket_id());
++  dev_config.nb_queue_pairs              = static_cast<uint16_t>(nof_qps);
++  if (::rte_cryptodev_configure(crypto_dev_id, &dev_config) != 0) {
++    return false;
++  }
++  for (unsigned qp = 0; qp != nof_qps; ++qp) {
++    struct rte_cryptodev_qp_conf qp_conf = {};
++    qp_conf.nb_descriptors               = CRYPTO_OPS;
++    if (::rte_cryptodev_queue_pair_setup(crypto_dev_id, static_cast<uint16_t>(qp), &qp_conf, ::rte_socket_id()) != 0) {
++      return false;
++    }
++  }
++  const uint32_t session_size = ::rte_cryptodev_sym_get_private_session_size(crypto_dev_id);
++  session_pool = ::rte_cryptodev_sym_session_pool_create("OFH_MACSEC_SESSION_POOL", 16, session_size, 0, 0,
++                                                         ::rte_socket_id());
++  op_pool      = ::rte_crypto_op_pool_create("OFH_MACSEC_OP_POOL", RTE_CRYPTO_OP_TYPE_SYMMETRIC, CRYPTO_OPS, 128,
++                                        CRYPTO_PRIVATE_SIZE, ::rte_socket_id());
++  return session_pool != nullptr && op_pool != nullptr && ::rte_cryptodev_start(crypto_dev_id) == 0;
++}
++
++void* macsec_engine::create_session(bool encrypt, const uint8_t* key)
++{
++  struct rte_crypto_sym_xform xform = {};
++  xform.type                        = RTE_CRYPTO_SYM_XFORM_AEAD;
++  xform.aead.op        = encrypt ? RTE_CRYPTO_AEAD_OP_ENCRYPT : RTE_CRYPTO_AEAD_OP_DECRYPT;
++  xform.aead.algo      = RTE_CRYPTO_AEAD_AES_GCM;
++  xform.aead.key.data  = key;
++  xform.aead.key.length = MACSEC_KEY_LEN;
++  xform.aead.iv.offset = CRYPTO_IV_OFFSET;
++  xform.aead.iv.length = 12;
++  xform.aead.digest_length = MACSEC_ICV_LEN;
++  xform.aead.aad_length    = MACSEC_AAD_LEN;
++  return ::rte_cryptodev_sym_session_create(crypto_dev_id, &xform, session_pool);
++}
++
++void macsec_engine::free_session(void* session)
++{
++  if (session != nullptr) {
++    ::rte_cryptodev_sym_session_free(crypto_dev_id, session);
++  }
++}
++
++int macsec_engine::thread_index()
++{
++  static thread_local int index = -2;
++  if (index == -2) {
++    const unsigned i = nof_threads.fetch_add(1);
++    index            = i < MAX_THREADS ? static_cast<int>(i) : -1;
++  }
++  return index;
++}
++
++void macsec_engine::wait_grace_period()
++{
++  const unsigned used = std::min<unsigned>(nof_threads.load(), MAX_THREADS);
++  const uint64_t deadline = ::rte_get_tsc_cycles() + ::rte_get_tsc_hz(); // 1 s
++  for (unsigned i = 0; i != used; ++i) {
++    const uint64_t seen = epochs[i].value.load(std::memory_order_seq_cst);
++    // Odd: the thread was inside a burst when we invalidated; wait for it to leave.
++    while ((seen & 1U) != 0U && epochs[i].value.load(std::memory_order_seq_cst) == seen &&
++           ::rte_get_tsc_cycles() < deadline) {
++      std::this_thread::sleep_for(std::chrono::microseconds(50));
++    }
++  }
++}
++
++// rte_crypto_op::sym is a zero-length array whose storage follows the op; GCC 16 flags the (valid) accesses.
++#pragma GCC diagnostic push
++#pragma GCC diagnostic ignored "-Warray-bounds"
++#pragma GCC diagnostic ignored "-Wzero-length-bounds"
++void macsec_engine::crypto_burst(unsigned                      qp,
++                                 const macsec_crypto_request* requests,
++                                 rte_mbuf**                    mbufs,
++                                 void**                        sessions,
++                                 bool*                         ok,
++                                 unsigned                      count)
++{
++  struct rte_crypto_op* ops[MAX_BURST];
++  for (unsigned i = 0; i != count; ++i) {
++    ok[i] = false;
++  }
++  if (count == 0U || ::rte_crypto_op_bulk_alloc(op_pool, RTE_CRYPTO_OP_TYPE_SYMMETRIC, ops, count) == 0U) {
++    return;
++  }
++  for (unsigned i = 0; i != count; ++i) {
++    const macsec_crypto_request& r    = requests[i];
++    uint8_t*                     base = rte_pktmbuf_mtod(mbufs[i], uint8_t*);
++    struct rte_crypto_op*        op   = ops[i];
++
++    memcpy(rte_crypto_op_ctod_offset(op, uint8_t*, CRYPTO_AAD_OFFSET), r.aad, r.aad_len);
++    memcpy(rte_crypto_op_ctod_offset(op, uint8_t*, CRYPTO_IV_OFFSET), r.nonce, 12);
++    *rte_crypto_op_ctod_offset(op, uint16_t*, CRYPTO_INDEX_OFFSET) = static_cast<uint16_t>(i);
++    ::rte_crypto_op_attach_sym_session(op, sessions[i]);
++    op->sym->m_src                    = mbufs[i];
++    op->sym->aead.data.offset         = static_cast<uint32_t>(r.input - base);
++    op->sym->aead.data.length         = static_cast<uint32_t>(r.input_len);
++    op->sym->aead.digest.data         = r.tag;
++    op->sym->aead.digest.phys_addr    = rte_pktmbuf_iova_offset(mbufs[i], static_cast<uint32_t>(r.tag - base));
++    op->sym->aead.aad.data            = rte_crypto_op_ctod_offset(op, uint8_t*, CRYPTO_AAD_OFFSET);
++    op->sym->aead.aad.phys_addr       = rte_crypto_op_ctophys_offset(op, CRYPTO_AAD_OFFSET);
++  }
++
++  const uint64_t deadline = ::rte_get_tsc_cycles() + ::rte_get_tsc_hz() / 1000000ULL * CRYPTO_TIMEOUT_US;
++  unsigned       submitted = 0;
++  while (submitted < count && ::rte_get_tsc_cycles() < deadline) {
++    const uint16_t sent =
++        ::rte_cryptodev_enqueue_burst(crypto_dev_id, static_cast<uint16_t>(qp), ops + submitted,
++                                      static_cast<uint16_t>(count - submitted));
++    submitted += sent;
++    if (sent == 0U) {
++      ::rte_pause();
++    }
++  }
++  unsigned completed = 0;
++  while (completed < submitted && ::rte_get_tsc_cycles() < deadline) {
++    struct rte_crypto_op* done[MAX_BURST];
++    const uint16_t        received = ::rte_cryptodev_dequeue_burst(crypto_dev_id, static_cast<uint16_t>(qp), done,
++                                                                   static_cast<uint16_t>(submitted - completed));
++    for (unsigned j = 0; j != received; ++j) {
++      const uint16_t index = *rte_crypto_op_ctod_offset(done[j], uint16_t*, CRYPTO_INDEX_OFFSET);
++      ok[index]            = done[j]->status == RTE_CRYPTO_OP_STATUS_SUCCESS;
++      ::rte_crypto_op_free(done[j]);
++      ops[index] = nullptr;
++    }
++    completed += received;
++    if (received == 0U) {
++      ::rte_pause();
++    }
++  }
++  // Operations never submitted (queue full / timeout) are still ours.
++  for (unsigned i = submitted; i != count; ++i) {
++    ::rte_crypto_op_free(ops[i]);
++  }
++}
++
++#pragma GCC diagnostic pop
++
++unsigned macsec_engine::protect_burst(rte_mbuf** mbufs, span<span<const uint8_t>> frames)
++{
++  const unsigned count = static_cast<unsigned>(frames.size());
++  auto free_all = [&](std::atomic<uint64_t>& counter) {
++    ::rte_pktmbuf_free_bulk(mbufs, count);
++    counter.fetch_add(count, std::memory_order_relaxed);
++    return 0U;
++  };
++  if (count == 0U) {
++    return 0;
++  }
++  const int ti = thread_index();
++  if (count > MAX_BURST || ti < 0) {
++    return free_all(stats.tx_dropped_other);
++  }
++  if (!tx_ready.load(std::memory_order_acquire)) {
++    return free_all(stats.tx_dropped_not_ready);
++  }
++  epoch_guard guard(epochs[ti].value);
++  const uint8_t an = active_tx_an.load(std::memory_order_seq_cst);
++  sa_slot&      slot = slots[an];
++  if (!slot.valid.load(std::memory_order_seq_cst)) {
++    return free_all(stats.tx_dropped_not_ready);
++  }
++
++  macsec_crypto_request requests[MAX_BURST];
++  rte_mbuf*             pending_mbufs[MAX_BURST];
++  void*                 sessions[MAX_BURST];
++  bool                  ok[MAX_BURST];
++  unsigned              n = 0;
++  uint64_t              dropped = 0;
++  for (unsigned i = 0; i != count; ++i) {
++    const auto frame = frames[i];
++    const size_t l2  = macsec_l2_header_len(frame.data(), frame.size());
++    uint8_t* data    = l2 == 0U ? nullptr
++                                : reinterpret_cast<uint8_t*>(::rte_pktmbuf_append(
++                                      mbufs[i], static_cast<uint16_t>(frame.size() + FRAME_OVERHEAD)));
++    size_t   secure_len = 0;
++    if (data != nullptr) {
++      // DA SA [VLAN] | 16 B for the SecTAG | EtherType + payload, in a single copy.
++      memcpy(data, frame.data(), l2);
++      memcpy(data + l2 + MACSEC_SECTAG_LEN, frame.data() + l2, frame.size() - l2);
++      const uint64_t pn = slot.next_pn.fetch_add(1, std::memory_order_relaxed);
++      if (macsec_prepare_protect_direct_pn(&slot.tx, pn, data, l2, frame.size(), frame.size() + FRAME_OVERHEAD,
++                                           &secure_len, &requests[n]) == MACSEC_OK) {
++        pending_mbufs[n] = mbufs[i];
++        sessions[n]      = slot.tx_session;
++        ++n;
++        continue;
++      }
++    }
++    ::rte_pktmbuf_free(mbufs[i]);
++    ++dropped;
++  }
++  crypto_burst(static_cast<unsigned>(ti), requests, pending_mbufs, sessions, ok, n);
++  unsigned out = 0;
++  for (unsigned k = 0; k != n; ++k) {
++    if (ok[k]) {
++      mbufs[out++] = pending_mbufs[k];
++    } else {
++      ::rte_pktmbuf_free(pending_mbufs[k]);
++      ++dropped;
++    }
++  }
++  stats.tx_ok.fetch_add(out, std::memory_order_relaxed);
++  if (dropped != 0U) {
++    stats.tx_dropped_other.fetch_add(dropped, std::memory_order_relaxed);
++  }
++  return out;
++}
++
++unsigned macsec_engine::verify_burst(rte_mbuf** mbufs, unsigned nof_mbufs)
++{
++  if (nof_mbufs == 0U) {
++    return 0;
++  }
++  const int ti = thread_index();
++  if (nof_mbufs > MAX_BURST || ti < 0) {
++    ::rte_pktmbuf_free_bulk(mbufs, nof_mbufs);
++    stats.rx_dropped_format.fetch_add(nof_mbufs, std::memory_order_relaxed);
++    return 0;
++  }
++  epoch_guard guard(epochs[ti].value);
++
++  macsec_crypto_request requests[MAX_BURST];
++  rte_mbuf*             pending_mbufs[MAX_BURST];
++  sa_slot*              pending_slots[MAX_BURST];
++  void*                 sessions[MAX_BURST];
++  bool                  ok[MAX_BURST];
++  unsigned              n = 0;
++  uint64_t              not_macsec = 0, no_sa = 0, replay = 0, format = 0, auth = 0;
++  for (unsigned i = 0; i != nof_mbufs; ++i) {
++    rte_mbuf* mbuf = mbufs[i];
++    uint8_t*  data = rte_pktmbuf_mtod(mbuf, uint8_t*);
++    uint8_t   an   = 0;
++    size_t    plain_len = 0;
++    if (mbuf->nb_segs != 1U || !macsec_peek_secure(data, rte_pktmbuf_pkt_len(mbuf), &an)) {
++      ++not_macsec;
++    } else if (!slots[an].valid.load(std::memory_order_seq_cst)) {
++      ++no_sa;
++    } else {
++      const auto status = macsec_prepare_unprotect_in_place(&slots[an].rx, data, rte_pktmbuf_pkt_len(mbuf), &plain_len,
++                                                            &requests[n]);
++      if (status == MACSEC_OK) {
++        pending_mbufs[n]  = mbuf;
++        pending_slots[n]  = &slots[an];
++        sessions[n]       = slots[an].rx_session;
++        ++n;
++        continue;
++      }
++      status == MACSEC_ERR_REPLAY ? ++replay : ++format;
++    }
++    ::rte_pktmbuf_free(mbuf);
++  }
++  crypto_burst(static_cast<unsigned>(ti), requests, pending_mbufs, sessions, ok, n);
++  unsigned out = 0;
++  for (unsigned k = 0; k != n; ++k) {
++    rte_mbuf* mbuf   = pending_mbufs[k];
++    const auto status = macsec_complete_unprotect(&pending_slots[k]->rx, &requests[k], ok[k] ? MACSEC_OK : MACSEC_ERR_AUTH);
++    if (status == MACSEC_OK) {
++      // Remove SecTAG and ICV, keep DA SA [VLAN] in front of the original EtherType.
++      uint8_t       header[MACSEC_MAX_L2_LEN];
++      const size_t  l2 = requests[k].l2_len;
++      memcpy(header, rte_pktmbuf_mtod(mbuf, uint8_t*), l2);
++      ::rte_pktmbuf_trim(mbuf, MACSEC_ICV_LEN);
++      ::rte_pktmbuf_adj(mbuf, MACSEC_SECTAG_LEN);
++      memcpy(rte_pktmbuf_mtod(mbuf, uint8_t*), header, l2);
++      mbufs[out++] = mbuf;
++      continue;
++    }
++    status == MACSEC_ERR_REPLAY ? ++replay : ++auth;
++    ::rte_pktmbuf_free(mbuf);
++  }
++  stats.rx_ok.fetch_add(out, std::memory_order_relaxed);
++  if (not_macsec) stats.rx_dropped_not_macsec.fetch_add(not_macsec, std::memory_order_relaxed);
++  if (no_sa) stats.rx_dropped_no_sa.fetch_add(no_sa, std::memory_order_relaxed);
++  if (replay) stats.rx_dropped_replay.fetch_add(replay, std::memory_order_relaxed);
++  if (format) stats.rx_dropped_format.fetch_add(format, std::memory_order_relaxed);
++  if (auth) stats.rx_dropped_auth.fetch_add(auth, std::memory_order_relaxed);
++  return out;
++}
++
++// ---------------------------------------------------------------------------------------------------------------------
++// Control plane: INSTALL / ACTIVATE / RETIRE / STATUS over a local SEQPACKET socket (same 96-byte protocol as the
++// gateway). Runs in its own thread, never in the real-time path.
++
++bool macsec_engine::handle_install(const key_control_command& command)
++{
++  const uint8_t an = command.association_number;
++  if (an >= NOF_AN || (an == active_tx_an.load() && tx_ready.load())) {
++    return false;
++  }
++  sa_slot& slot = slots[an];
++  slot.valid.store(false, std::memory_order_seq_cst);
++  wait_grace_period();
++  free_session(slot.tx_session);
++  free_session(slot.rx_session);
++  slot.tx_session = nullptr;
++  slot.rx_session = nullptr;
++
++  macsec_tx_sa_init(&slot.tx, command.tx_key, cfg.tx_sci, command.tx_salt, cfg.tx_ssci, an, 1U);
++  macsec_rx_sa_init(&slot.rx, command.rx_key, cfg.rx_sci, command.rx_salt, cfg.rx_ssci, an, cfg.replay_window);
++  slot.next_pn.store(1U);
++  slot.tx_session = create_session(true, command.tx_key);
++  slot.rx_session = create_session(false, command.rx_key);
++  if (slot.tx_session == nullptr || slot.rx_session == nullptr) {
++    free_session(slot.tx_session);
++    free_session(slot.rx_session);
++    slot.tx_session = nullptr;
++    slot.rx_session = nullptr;
++    secure_zero(&slot.tx, sizeof(slot.tx));
++    secure_zero(&slot.rx, sizeof(slot.rx));
++    return false;
++  }
++  slot.valid.store(true, std::memory_order_seq_cst);
++  pending    = true;
++  pending_an = an;
++  fmt::print("MACsec - control installed AN={}\n", an);
++  return true;
++}
++
++bool macsec_engine::handle_activate(uint8_t an)
++{
++  if (!pending || an != pending_an || an >= NOF_AN || !slots[an].valid.load()) {
++    return false;
++  }
++  active_tx_an.store(an, std::memory_order_seq_cst);
++  tx_ready.store(true, std::memory_order_release);
++  pending = false;
++  stats.rekeys.fetch_add(1, std::memory_order_relaxed);
++  fmt::print("MACsec - control activated AN={}\n", an);
++  return true;
++}
++
++bool macsec_engine::handle_retire(uint8_t an)
++{
++  if (an >= NOF_AN || (an == active_tx_an.load() && tx_ready.load())) {
++    return false;
++  }
++  sa_slot& slot = slots[an];
++  slot.valid.store(false, std::memory_order_seq_cst);
++  wait_grace_period();
++  free_session(slot.tx_session);
++  free_session(slot.rx_session);
++  slot.tx_session = nullptr;
++  slot.rx_session = nullptr;
++  secure_zero(&slot.tx, sizeof(slot.tx));
++  secure_zero(&slot.rx, sizeof(slot.rx));
++  if (pending && pending_an == an) {
++    pending = false;
++  }
++  fmt::print("MACsec - control retired AN={}\n", an);
++  return true;
++}
++
++size_t macsec_engine::status_string(char* out, size_t capacity) const
++{
++  const int n = pending ? snprintf(out, capacity, "STATUS ACTIVE=%u READY=%u PENDING=%u\n", active_tx_an.load(),
++                                   tx_ready.load() ? 1U : 0U, pending_an)
++                        : snprintf(out, capacity, "STATUS ACTIVE=%u READY=%u PENDING=-\n", active_tx_an.load(),
++                                   tx_ready.load() ? 1U : 0U);
++  return n > 0 ? static_cast<size_t>(n) : 0U;
++}
++
++void macsec_engine::control_loop()
++{
++  while (!stop.load()) {
++    struct pollfd pfd = {listener, POLLIN, 0};
++    if (::poll(&pfd, 1, 100) <= 0) {
++      continue;
++    }
++    const int client = ::accept4(listener, nullptr, nullptr, SOCK_CLOEXEC);
++    if (client < 0) {
++      continue;
++    }
++    struct ucred creds = {};
++    socklen_t    creds_len = sizeof(creds);
++    char         response[96];
++    size_t       response_len = 0;
++    if (::getsockopt(client, SOL_SOCKET, SO_PEERCRED, &creds, &creds_len) != 0 || creds.uid != ::geteuid()) {
++      response_len = static_cast<size_t>(snprintf(response, sizeof(response), "DENIED\n"));
++    } else {
++      struct key_control_wire_message wire;
++      key_control_command             command;
++      memset(&wire, 0, sizeof(wire));
++      const ssize_t length = ::recv(client, &wire, sizeof(wire), MSG_TRUNC);
++      if (length != static_cast<ssize_t>(sizeof(wire)) ||
++          !key_control_decode(&wire, static_cast<size_t>(length), &command)) {
++        response_len = static_cast<size_t>(snprintf(response, sizeof(response), "INVALID\n"));
++      } else {
++        bool accepted = false;
++        switch (command.operation) {
++          case KEY_CONTROL_STATUS:
++            response_len = status_string(response, sizeof(response));
++            accepted     = response_len != 0U;
++            break;
++          case KEY_CONTROL_INSTALL:
++            accepted = handle_install(command);
++            break;
++          case KEY_CONTROL_ACTIVATE:
++            accepted = handle_activate(command.association_number);
++            break;
++          case KEY_CONTROL_RETIRE:
++            accepted = handle_retire(command.association_number);
++            break;
++          default:
++            break;
++        }
++        if (response_len == 0U) {
++          response_len = static_cast<size_t>(snprintf(response, sizeof(response), accepted ? "OK\n" : "REJECTED\n"));
++        }
++        key_control_clear(&command);
++      }
++      key_control_wire_clear(&wire);
++    }
++    (void)::send(client, response, response_len, MSG_NOSIGNAL);
++    ::close(client);
++  }
++}
+diff --git a/lib/ofh/ethernet/dpdk/macsec/macsec_engine.h b/lib/ofh/ethernet/dpdk/macsec/macsec_engine.h
+new file mode 100644
+index 0000000..cbcd964
+--- /dev/null
++++ b/lib/ofh/ethernet/dpdk/macsec/macsec_engine.h
+@@ -0,0 +1,148 @@
++// SPDX-License-Identifier: BSD-3-Clause-Open-MPI
++//
++// MACsec SecY for the OCUDU DPDK Ethernet transmitter/receiver (prototype, PoC MACsec-PQC).
++//
++// TX: the SecTAG is placed after DA/SA/[802.1Q] while the frame is copied into the mbuf; the ICV is appended and
++//     AES-256-GCM-XPN runs in a DPDK cryptodev burst. RX: verified in place right after rte_eth_rx_burst.
++// Real-time threads never allocate sessions, take locks or block on the control plane: SAs live in four slots (one per
++// Association Number) published with release/acquire, and the control thread retires a slot only after every data
++// thread has left its burst (epoch-based grace period).
++
++#pragma once
++
++#include "ocudu/adt/span.h"
++#include <array>
++#include <atomic>
++#include <cstdint>
++#include <memory>
++#include <string>
++#include <thread>
++
++extern "C" {
++#include "secy_core/key_control.h"
++#include "secy_core/macsec.h"
++}
++
++struct rte_mbuf;
++struct rte_mempool;
++
++namespace ocudu {
++namespace ether {
++
++/// Statistics of the MACsec engine (monotonic counters).
++struct macsec_engine_stats {
++  uint64_t tx_ok = 0;
++  uint64_t tx_dropped_not_ready = 0;
++  uint64_t tx_dropped_other = 0;
++  uint64_t rx_ok = 0;
++  uint64_t rx_dropped_not_macsec = 0;
++  uint64_t rx_dropped_no_sa = 0;
++  uint64_t rx_dropped_auth = 0;
++  uint64_t rx_dropped_replay = 0;
++  uint64_t rx_dropped_format = 0;
++  uint64_t rekeys = 0;
++};
++
++class macsec_engine
++{
++public:
++  /// Extra bytes added by MACsec to every frame (SecTAG with SCI and ICV).
++  static constexpr unsigned FRAME_OVERHEAD = MACSEC_FRAME_OVERHEAD;
++
++  /// Creates the engine from the environment (OCUDU_MACSEC=1, OCUDU_MACSEC_CONTROL_SOCKET, ..._TX_SCI, ..._RX_SCI,
++  /// ..._TX_SSCI, ..._RX_SSCI, ..._REPLAY_WINDOW). Returns nullptr when MACsec is not enabled. Aborts on a bad config.
++  static std::unique_ptr<macsec_engine> create_from_env();
++
++  /// True when OCUDU_MACSEC=1 (the engine is going to be created).
++  static bool is_enabled_in_env();
++
++  ~macsec_engine();
++  macsec_engine(const macsec_engine&)            = delete;
++  macsec_engine& operator=(const macsec_engine&) = delete;
++
++  /// Protects a burst for transmission. \c mbufs are freshly allocated and empty; \c frames hold the plain frames
++  /// (DA SA [VLAN] EtherType payload). Returns the number of ready mbufs, which are compacted at the front of
++  /// \c mbufs; the others are freed. With no active SA nothing is transmitted.
++  unsigned protect_burst(rte_mbuf** mbufs, span<span<const uint8_t>> frames);
++
++  /// Verifies and strips MACsec from a received burst, in place. Returns the number of surviving mbufs, compacted at
++  /// the front of \c mbufs; the others are freed. Frames that are not MACsec are dropped. Must be called from a single
++  /// receive thread (the anti-replay window is not shared).
++  unsigned verify_burst(rte_mbuf** mbufs, unsigned nof_mbufs);
++
++  /// Returns a snapshot of the counters.
++  macsec_engine_stats get_stats() const;
++
++private:
++  struct config {
++    std::string control_socket;
++    uint8_t     tx_sci[MACSEC_SCI_LEN] = {};
++    uint8_t     rx_sci[MACSEC_SCI_LEN] = {};
++    uint32_t    tx_ssci                = 1;
++    uint32_t    rx_ssci                = 2;
++    uint8_t     replay_window          = MACSEC_MAX_REPLAY_WINDOW;
++  };
++
++  static constexpr unsigned NOF_AN         = 4;
++  static constexpr unsigned MAX_THREADS    = 8; // One cryptodev queue pair and one epoch counter per data thread.
++  static constexpr unsigned MAX_BURST      = 64;
++
++  struct sa_slot {
++    macsec_tx_sa          tx{};
++    macsec_rx_sa          rx{};
++    std::atomic<uint64_t> next_pn{1};
++    void*                 tx_session = nullptr;
++    void*                 rx_session = nullptr;
++    std::atomic<bool>     valid{false};
++  };
++
++  struct alignas(64) thread_epoch {
++    std::atomic<uint64_t> value{0}; // Odd while the thread is inside a burst.
++  };
++
++  explicit macsec_engine(const config& cfg);
++
++  bool init_cryptodev();
++  void* create_session(bool encrypt, const uint8_t* key);
++  void  free_session(void* session);
++
++  /// Returns the data-thread index (0..MAX_THREADS-1) or -1 when there are too many threads.
++  int  thread_index();
++  void wait_grace_period();
++
++  /// Runs a burst through the cryptodev; \c ok[i] tells whether request i succeeded.
++  void crypto_burst(unsigned qp, const macsec_crypto_request* requests, rte_mbuf** mbufs, void** sessions, bool* ok,
++                    unsigned count);
++
++  void control_loop();
++  bool handle_install(const key_control_command& command);
++  bool handle_activate(uint8_t an);
++  bool handle_retire(uint8_t an);
++  size_t status_string(char* out, size_t capacity) const;
++
++  config                         cfg;
++  uint8_t                        crypto_dev_id = 0;
++  rte_mempool*                   op_pool       = nullptr;
++  rte_mempool*                   session_pool  = nullptr;
++  std::array<sa_slot, NOF_AN>    slots;
++  std::atomic<uint8_t>           active_tx_an{0};
++  std::atomic<bool>              tx_ready{false};
++  std::array<thread_epoch, MAX_THREADS> epochs;
++  std::atomic<unsigned>          nof_threads{0};
++
++  // Control plane (single thread, outside the real-time path).
++  std::thread       control_thread;
++  std::atomic<bool> stop{false};
++  int               listener   = -1;
++  bool              pending    = false;
++  uint8_t           pending_an = 0;
++
++  struct atomic_stats {
++    std::atomic<uint64_t> tx_ok{0}, tx_dropped_not_ready{0}, tx_dropped_other{0};
++    std::atomic<uint64_t> rx_ok{0}, rx_dropped_not_macsec{0}, rx_dropped_no_sa{0}, rx_dropped_auth{0},
++        rx_dropped_replay{0}, rx_dropped_format{0}, rekeys{0};
++  } stats;
++};
++
++} // namespace ether
++} // namespace ocudu
+diff --git a/lib/ofh/ethernet/dpdk/macsec/secy_core/key_control.c b/lib/ofh/ethernet/dpdk/macsec/secy_core/key_control.c
+new file mode 100644
+index 0000000..fb0efbe
+--- /dev/null
++++ b/lib/ofh/ethernet/dpdk/macsec/secy_core/key_control.c
+@@ -0,0 +1,211 @@
++#include "key_control.h"
++
++#ifndef MACSEC_NO_OPENSSL
++#include <openssl/crypto.h>
++#define KC_CLEANSE(p, n) OPENSSL_cleanse((p), (n))
++#else
++/* escrita via ponteiro volatil: o otimizador nao pode remover (explicit_bzero
++ * exigiria _DEFAULT_SOURCE em C estrito) */
++#include <stddef.h>
++static void kc_cleanse(void *p, size_t n)
++{
++    volatile unsigned char *v = (volatile unsigned char *)p;
++    while (n-- != 0U) *v++ = 0U;
++}
++#define KC_CLEANSE(p, n) kc_cleanse((p), (n))
++#endif
++#include <stddef.h>
++#include <stdlib.h>
++#include <string.h>
++
++_Static_assert(sizeof(struct key_control_wire_message) == KEY_CONTROL_WIRE_SIZE,
++               "unexpected key-control wire padding");
++
++static void store_be32(uint8_t output[4], uint32_t value)
++{
++    output[0] = (uint8_t)(value >> 24);
++    output[1] = (uint8_t)(value >> 16);
++    output[2] = (uint8_t)(value >> 8);
++    output[3] = (uint8_t)value;
++}
++
++static uint32_t load_be32(const uint8_t input[4])
++{
++    return ((uint32_t)input[0] << 24) | ((uint32_t)input[1] << 16) |
++           ((uint32_t)input[2] << 8) | input[3];
++}
++
++static int hex_nibble(char value)
++{
++    if (value >= '0' && value <= '9') return value - '0';
++    if (value >= 'a' && value <= 'f') return value - 'a' + 10;
++    if (value >= 'A' && value <= 'F') return value - 'A' + 10;
++    return -1;
++}
++
++static bool parse_hex(const char *text, size_t text_len,
++                      uint8_t *output, size_t output_len)
++{
++    size_t i;
++
++    if (text_len != output_len * 2U) return false;
++    for (i = 0; i < output_len; i++) {
++        int high = hex_nibble(text[i * 2U]);
++        int low = hex_nibble(text[i * 2U + 1U]);
++        if (high < 0 || low < 0) return false;
++        output[i] = (uint8_t)((high << 4) | low);
++    }
++    return true;
++}
++
++static bool parse_an(const char *text, size_t length, uint8_t *an)
++{
++    if (length != 1U || text[0] < '0' || text[0] > '3') return false;
++    *an = (uint8_t)(text[0] - '0');
++    return true;
++}
++
++static bool field(const char *token, size_t token_len, const char *name,
++                  const char **value, size_t *value_len)
++{
++    size_t name_len = strlen(name);
++    if (token_len <= name_len || memcmp(token, name, name_len) != 0 ||
++        token[name_len] != '=') return false;
++    *value = token + name_len + 1U;
++    *value_len = token_len - name_len - 1U;
++    return true;
++}
++
++bool key_control_parse(const char *message, struct key_control_command *command)
++{
++    const char *cursor;
++    bool have_an = false, have_tx = false, have_rx = false;
++    bool have_tx_salt = false, have_rx_salt = false;
++
++    if (message == NULL || command == NULL) return false;
++    memset(command, 0, sizeof(*command));
++    if (strcmp(message, "STATUS") == 0 || strcmp(message, "STATUS\n") == 0) {
++        command->operation = KEY_CONTROL_STATUS;
++        return true;
++    } else if (strncmp(message, "INSTALL ", 8U) == 0) {
++        command->operation = KEY_CONTROL_INSTALL;
++        cursor = message + 8U;
++    } else if (strncmp(message, "ACTIVATE ", 9U) == 0) {
++        command->operation = KEY_CONTROL_ACTIVATE;
++        cursor = message + 9U;
++    } else if (strncmp(message, "RETIRE ", 7U) == 0) {
++        command->operation = KEY_CONTROL_RETIRE;
++        cursor = message + 7U;
++    } else {
++        return false;
++    }
++
++    while (*cursor != '\0' && *cursor != '\n') {
++        const char *end;
++        const char *value;
++        size_t token_len, value_len;
++        while (*cursor == ' ') cursor++;
++        if (*cursor == '\0' || *cursor == '\n') break;
++        end = cursor;
++        while (*end != '\0' && *end != '\n' && *end != ' ') end++;
++        token_len = (size_t)(end - cursor);
++        if (field(cursor, token_len, "AN", &value, &value_len)) {
++            if (have_an || !parse_an(value, value_len, &command->association_number)) goto invalid;
++            have_an = true;
++        } else if (field(cursor, token_len, "TX_KEY", &value, &value_len)) {
++            if (have_tx || !parse_hex(value, value_len, command->tx_key, MACSEC_KEY_LEN)) goto invalid;
++            have_tx = true;
++        } else if (field(cursor, token_len, "RX_KEY", &value, &value_len)) {
++            if (have_rx || !parse_hex(value, value_len, command->rx_key, MACSEC_KEY_LEN)) goto invalid;
++            have_rx = true;
++        } else if (field(cursor, token_len, "TX_SALT", &value, &value_len)) {
++            if (have_tx_salt || !parse_hex(value, value_len, command->tx_salt, MACSEC_SALT_LEN)) goto invalid;
++            have_tx_salt = true;
++        } else if (field(cursor, token_len, "RX_SALT", &value, &value_len)) {
++            if (have_rx_salt || !parse_hex(value, value_len, command->rx_salt, MACSEC_SALT_LEN)) goto invalid;
++            have_rx_salt = true;
++        } else {
++invalid:
++            key_control_clear(command);
++            return false;
++        }
++        cursor = end;
++    }
++    if (!have_an || (command->operation == KEY_CONTROL_INSTALL &&
++        (!have_tx || !have_rx || !have_tx_salt || !have_rx_salt)) ||
++        (command->operation != KEY_CONTROL_INSTALL &&
++         (have_tx || have_rx || have_tx_salt || have_rx_salt))) {
++        key_control_clear(command);
++        return false;
++    }
++    return true;
++}
++
++bool key_control_encode(const struct key_control_command *command,
++                        struct key_control_wire_message *wire)
++{
++    uint32_t payload_length;
++
++    if (command == NULL || wire == NULL ||
++        command->operation < KEY_CONTROL_INSTALL ||
++        command->operation > KEY_CONTROL_STATUS ||
++        (command->operation != KEY_CONTROL_STATUS &&
++         command->association_number > 3U)) return false;
++    memset(wire, 0, sizeof(*wire));
++    wire->version = KEY_CONTROL_VERSION;
++    wire->operation = (uint8_t)command->operation;
++    wire->association_number = command->association_number;
++    payload_length = command->operation == KEY_CONTROL_INSTALL
++                         ? KEY_CONTROL_INSTALL_PAYLOAD_SIZE
++                         : 0U;
++    store_be32(wire->payload_length_be, payload_length);
++    if (command->operation == KEY_CONTROL_INSTALL) {
++        memcpy(wire->tx_key, command->tx_key, sizeof(wire->tx_key));
++        memcpy(wire->rx_key, command->rx_key, sizeof(wire->rx_key));
++        memcpy(wire->tx_salt, command->tx_salt, sizeof(wire->tx_salt));
++        memcpy(wire->rx_salt, command->rx_salt, sizeof(wire->rx_salt));
++    }
++    return true;
++}
++
++bool key_control_decode(const struct key_control_wire_message *wire,
++                        size_t wire_length, struct key_control_command *command)
++{
++    uint32_t payload_length;
++    uint8_t zero_payload[KEY_CONTROL_INSTALL_PAYLOAD_SIZE] = {0};
++
++    if (wire == NULL || command == NULL || wire_length != sizeof(*wire) ||
++        wire->version != KEY_CONTROL_VERSION || wire->reserved != 0U ||
++        wire->operation < KEY_CONTROL_INSTALL ||
++        wire->operation > KEY_CONTROL_STATUS) return false;
++    payload_length = load_be32(wire->payload_length_be);
++    if ((wire->operation == KEY_CONTROL_INSTALL &&
++         payload_length != KEY_CONTROL_INSTALL_PAYLOAD_SIZE) ||
++        (wire->operation != KEY_CONTROL_INSTALL && payload_length != 0U) ||
++        (wire->operation != KEY_CONTROL_STATUS && wire->association_number > 3U) ||
++        (wire->operation == KEY_CONTROL_STATUS && wire->association_number != 0U) ||
++        (wire->operation != KEY_CONTROL_INSTALL &&
++         memcmp(wire->tx_key, zero_payload, sizeof(zero_payload)) != 0)) {
++        return false;
++    }
++    memset(command, 0, sizeof(*command));
++    command->operation = (enum key_control_operation)wire->operation;
++    command->association_number = wire->association_number;
++    if (command->operation == KEY_CONTROL_INSTALL) {
++        memcpy(command->tx_key, wire->tx_key, sizeof(command->tx_key));
++        memcpy(command->rx_key, wire->rx_key, sizeof(command->rx_key));
++        memcpy(command->tx_salt, wire->tx_salt, sizeof(command->tx_salt));
++        memcpy(command->rx_salt, wire->rx_salt, sizeof(command->rx_salt));
++    }
++    return true;
++}
++
++void key_control_clear(struct key_control_command *command)
++{
++    if (command != NULL) KC_CLEANSE(command, sizeof(*command));
++}
++
++void key_control_wire_clear(struct key_control_wire_message *wire)
++{
++    if (wire != NULL) KC_CLEANSE(wire, sizeof(*wire));
++}
+diff --git a/lib/ofh/ethernet/dpdk/macsec/secy_core/key_control.h b/lib/ofh/ethernet/dpdk/macsec/secy_core/key_control.h
+new file mode 100644
+index 0000000..51f2c9c
+--- /dev/null
++++ b/lib/ofh/ethernet/dpdk/macsec/secy_core/key_control.h
+@@ -0,0 +1,51 @@
++#ifndef POC_KEY_CONTROL_H
++#define POC_KEY_CONTROL_H
++
++#include "macsec.h"
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++#define KEY_CONTROL_VERSION 1U
++#define KEY_CONTROL_WIRE_SIZE 96U
++#define KEY_CONTROL_INSTALL_PAYLOAD_SIZE 88U
++
++enum key_control_operation {
++    KEY_CONTROL_INVALID = 0,
++    KEY_CONTROL_INSTALL,
++    KEY_CONTROL_ACTIVATE,
++    KEY_CONTROL_RETIRE,
++    KEY_CONTROL_STATUS
++};
++
++struct key_control_command {
++    enum key_control_operation operation;
++    uint8_t association_number;
++    uint8_t tx_key[MACSEC_KEY_LEN];
++    uint8_t rx_key[MACSEC_KEY_LEN];
++    uint8_t tx_salt[MACSEC_SALT_LEN];
++    uint8_t rx_salt[MACSEC_SALT_LEN];
++};
++
++struct key_control_wire_message {
++    uint8_t version;
++    uint8_t operation;
++    uint8_t association_number;
++    uint8_t reserved;
++    uint8_t payload_length_be[4];
++    uint8_t tx_key[MACSEC_KEY_LEN];
++    uint8_t rx_key[MACSEC_KEY_LEN];
++    uint8_t tx_salt[MACSEC_SALT_LEN];
++    uint8_t rx_salt[MACSEC_SALT_LEN];
++};
++
++bool key_control_parse(const char *message, struct key_control_command *command);
++bool key_control_encode(const struct key_control_command *command,
++                        struct key_control_wire_message *wire);
++bool key_control_decode(const struct key_control_wire_message *wire,
++                        size_t wire_length, struct key_control_command *command);
++void key_control_clear(struct key_control_command *command);
++void key_control_wire_clear(struct key_control_wire_message *wire);
++
++#endif
+diff --git a/lib/ofh/ethernet/dpdk/macsec/secy_core/macsec.c b/lib/ofh/ethernet/dpdk/macsec/secy_core/macsec.c
+new file mode 100644
+index 0000000..9deb3d1
+--- /dev/null
++++ b/lib/ofh/ethernet/dpdk/macsec/secy_core/macsec.c
+@@ -0,0 +1,596 @@
++#include "macsec.h"
++
++#include <limits.h>
++#ifndef MACSEC_NO_OPENSSL
++#include <openssl/evp.h>
++#endif
++#include <string.h>
++
++#define ETHERNET_HEADER_LEN 14U
++#define MAC_ADDRESSES_LEN 12U
++#define SECTAG_WITH_SCI_LEN 16U
++#define VLAN_TAG_LEN 4U
++#define MACSEC_OVERHEAD (SECTAG_WITH_SCI_LEN + MACSEC_ICV_LEN)
++
++#define TCI_SC 0x20U
++#define TCI_E 0x08U
++#define TCI_C 0x04U
++#define TCI_AN_MASK 0x03U
++#define TCI_PROFILE (TCI_SC | TCI_E | TCI_C)
++
++static macsec_aead_backend_fn aead_backend;
++static void *aead_backend_context;
++
++void macsec_set_aead_backend(macsec_aead_backend_fn backend, void *context)
++{
++    aead_backend = backend;
++    aead_backend_context = context;
++}
++
++static uint16_t load_be16(const uint8_t *p)
++{
++    return (uint16_t)(((uint16_t)p[0] << 8) | p[1]);
++}
++
++static uint32_t load_be32(const uint8_t *p)
++{
++    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
++           ((uint32_t)p[2] << 8) | p[3];
++}
++
++static void store_be16(uint8_t *p, uint16_t value)
++{
++    p[0] = (uint8_t)(value >> 8);
++    p[1] = (uint8_t)value;
++}
++
++static void store_be32(uint8_t *p, uint32_t value)
++{
++    p[0] = (uint8_t)(value >> 24);
++    p[1] = (uint8_t)(value >> 16);
++    p[2] = (uint8_t)(value >> 8);
++    p[3] = (uint8_t)value;
++}
++
++static void store_be64(uint8_t *p, uint64_t value)
++{
++    store_be32(p, (uint32_t)(value >> 32));
++    store_be32(p + 4, (uint32_t)value);
++}
++
++static void make_xpn_nonce(uint8_t nonce[12], uint32_t ssci, uint64_t pn,
++                           const uint8_t salt[MACSEC_SALT_LEN])
++{
++    size_t i;
++    store_be32(nonce, ssci);
++    store_be64(nonce + 4, pn);
++    for (i = 0; i < 12U; i++) {
++        nonce[i] ^= salt[i];
++    }
++}
++
++static uint64_t recover_xpn(const struct macsec_rx_sa *sa, uint32_t low)
++{
++    uint64_t expected = sa->highest_pn == 0U ? 1U : sa->highest_pn + 1U;
++    uint64_t upper = expected & UINT64_C(0xffffffff00000000);
++    uint64_t recovered = upper | low;
++    uint32_t expected_low = (uint32_t)expected;
++
++    if (low < expected_low && ((low ^ expected_low) & UINT32_C(0x80000000)) != 0U) {
++        if (upper != UINT64_C(0xffffffff00000000)) {
++            recovered += UINT64_C(0x100000000);
++        }
++    } else if (low > expected_low &&
++               ((low ^ expected_low) & UINT32_C(0x80000000)) != 0U &&
++               upper != 0U) {
++        recovered -= UINT64_C(0x100000000);
++    }
++    return recovered;
++}
++
++static bool replay_rejected(const struct macsec_rx_sa *sa, uint64_t pn)
++{
++    uint64_t distance;
++
++    if (pn == 0U) {
++        return true;
++    }
++    if (sa->highest_pn == 0U || pn > sa->highest_pn) {
++        return false;
++    }
++    distance = sa->highest_pn - pn;
++    return distance >= sa->replay_window ||
++           (sa->replay_bitmap & (UINT64_C(1) << distance)) != 0U;
++}
++
++static void replay_accept(struct macsec_rx_sa *sa, uint64_t pn)
++{
++    if (sa->highest_pn == 0U) {
++        sa->highest_pn = pn;
++        sa->replay_bitmap = UINT64_C(1);
++    } else if (pn > sa->highest_pn) {
++        uint64_t shift = pn - sa->highest_pn;
++        sa->replay_bitmap = shift >= MACSEC_MAX_REPLAY_WINDOW
++                                ? UINT64_C(1)
++                                : (sa->replay_bitmap << shift) | UINT64_C(1);
++        sa->highest_pn = pn;
++    } else {
++        sa->replay_bitmap |= UINT64_C(1) << (sa->highest_pn - pn);
++    }
++
++    if (sa->replay_window < MACSEC_MAX_REPLAY_WINDOW) {
++        sa->replay_bitmap &= (UINT64_C(1) << sa->replay_window) - 1U;
++    }
++}
++
++#ifndef MACSEC_NO_OPENSSL
++static enum macsec_status gcm_encrypt(const uint8_t key[MACSEC_KEY_LEN],
++                                      const uint8_t nonce[12],
++                                      const uint8_t *aad,
++                                      size_t aad_len,
++                                      const uint8_t *input,
++                                      size_t input_len,
++                                      uint8_t *output,
++                                      uint8_t tag[MACSEC_ICV_LEN])
++{
++    EVP_CIPHER_CTX *ctx = NULL;
++    int count = 0;
++    int final_count = 0;
++    enum macsec_status status = MACSEC_ERR_CRYPTO;
++
++    if (aad_len > INT_MAX || input_len > INT_MAX) {
++        return MACSEC_ERR_ARGUMENT;
++    }
++    ctx = EVP_CIPHER_CTX_new();
++    if (ctx == NULL || EVP_EncryptInit_ex2(ctx, EVP_aes_256_gcm(), key, nonce, NULL) != 1 ||
++        EVP_EncryptUpdate(ctx, NULL, &count, aad, (int)aad_len) != 1 ||
++        EVP_EncryptUpdate(ctx, output, &count, input, (int)input_len) != 1 ||
++        EVP_EncryptFinal_ex(ctx, output + count, &final_count) != 1 ||
++        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG, MACSEC_ICV_LEN, tag) != 1) {
++        goto done;
++    }
++    status = MACSEC_OK;
++
++done:
++    EVP_CIPHER_CTX_free(ctx);
++    return status;
++}
++
++static enum macsec_status gcm_decrypt(const uint8_t key[MACSEC_KEY_LEN],
++                                      const uint8_t nonce[12],
++                                      const uint8_t *aad,
++                                      size_t aad_len,
++                                      const uint8_t *input,
++                                      size_t input_len,
++                                      const uint8_t tag[MACSEC_ICV_LEN],
++                                      uint8_t *output)
++{
++    EVP_CIPHER_CTX *ctx = NULL;
++    int count = 0;
++    int final_count = 0;
++    enum macsec_status status = MACSEC_ERR_CRYPTO;
++
++    if (aad_len > INT_MAX || input_len > INT_MAX) {
++        return MACSEC_ERR_ARGUMENT;
++    }
++    ctx = EVP_CIPHER_CTX_new();
++    if (ctx == NULL || EVP_DecryptInit_ex2(ctx, EVP_aes_256_gcm(), key, nonce, NULL) != 1 ||
++        EVP_DecryptUpdate(ctx, NULL, &count, aad, (int)aad_len) != 1 ||
++        EVP_DecryptUpdate(ctx, output, &count, input, (int)input_len) != 1 ||
++        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG, MACSEC_ICV_LEN, (void *)tag) != 1) {
++        goto done;
++    }
++    if (EVP_DecryptFinal_ex(ctx, output + count, &final_count) != 1) {
++        status = MACSEC_ERR_AUTH;
++        goto done;
++    }
++    status = MACSEC_OK;
++
++done:
++    EVP_CIPHER_CTX_free(ctx);
++    return status;
++}
++
++#endif /* MACSEC_NO_OPENSSL */
++
++void macsec_tx_sa_init(struct macsec_tx_sa *sa,
++                       const uint8_t key[MACSEC_KEY_LEN],
++                       const uint8_t sci[MACSEC_SCI_LEN],
++                       const uint8_t salt[MACSEC_SALT_LEN], uint32_t ssci,
++                       uint8_t association_number,
++                       uint64_t initial_pn)
++{
++    memset(sa, 0, sizeof(*sa));
++    memcpy(sa->key, key, MACSEC_KEY_LEN);
++    memcpy(sa->sci, sci, MACSEC_SCI_LEN);
++    memcpy(sa->salt, salt, MACSEC_SALT_LEN);
++    sa->ssci = ssci;
++    sa->association_number = association_number & TCI_AN_MASK;
++    sa->next_pn = initial_pn;
++}
++
++void macsec_rx_sa_init(struct macsec_rx_sa *sa,
++                       const uint8_t key[MACSEC_KEY_LEN],
++                       const uint8_t sci[MACSEC_SCI_LEN],
++                       const uint8_t salt[MACSEC_SALT_LEN], uint32_t ssci,
++                       uint8_t association_number,
++                       uint8_t replay_window)
++{
++    memset(sa, 0, sizeof(*sa));
++    memcpy(sa->key, key, MACSEC_KEY_LEN);
++    memcpy(sa->sci, sci, MACSEC_SCI_LEN);
++    memcpy(sa->salt, salt, MACSEC_SALT_LEN);
++    sa->ssci = ssci;
++    sa->association_number = association_number & TCI_AN_MASK;
++    sa->replay_window = replay_window == 0U || replay_window > MACSEC_MAX_REPLAY_WINDOW
++                            ? MACSEC_MAX_REPLAY_WINDOW
++                            : replay_window;
++}
++
++/* Layout (VLAN opcional fica FORA do AAD, do ICV e da cifra):
++ *   plain : DA SA [8100 TCI] ET payload
++ *   secure: DA SA [8100 TCI] 88E5 SecTAG(TCI SL PN SCI) ET payload ICV
++ *   AAD   : DA SA 88E5 TCI SL PN SCI (28 bytes, montado em buffer proprio) */
++
++static bool is_vlan_ethertype(uint16_t et)
++{
++    return et == 0x8100U || et == 0x88a8U;
++}
++
++size_t macsec_l2_header_len(const uint8_t *frame, size_t len)
++{
++    size_t hdr;
++
++    if (frame == NULL || len < ETHERNET_HEADER_LEN) return 0U;
++    hdr = is_vlan_ethertype(load_be16(frame + 12)) ? MAC_ADDRESSES_LEN + VLAN_TAG_LEN
++                                                    : MAC_ADDRESSES_LEN;
++    return len >= hdr + 2U ? hdr : 0U;
++}
++
++bool macsec_peek_secure(const uint8_t *frame, size_t len, uint8_t *an)
++{
++    size_t l2;
++
++    if (frame == NULL || len < MAC_ADDRESSES_LEN + 2U) return false;
++    l2 = is_vlan_ethertype(load_be16(frame + 12)) ? MAC_ADDRESSES_LEN + VLAN_TAG_LEN
++                                                   : MAC_ADDRESSES_LEN;
++    if (len < l2 + 3U || load_be16(frame + l2) != MACSEC_ETHERTYPE) return false;
++    if (an != NULL) *an = frame[l2 + 2U] & TCI_AN_MASK;
++    return true;
++}
++
++static void write_sectag(uint8_t *p, const struct macsec_tx_sa *sa,
++                         size_t protected_len, uint64_t pn)
++{
++    store_be16(p, MACSEC_ETHERTYPE);
++    p[2] = (uint8_t)(TCI_PROFILE | sa->association_number);
++    p[3] = protected_len < 48U ? (uint8_t)protected_len : 0U;
++    store_be32(p + 4, (uint32_t)pn);
++    memcpy(p + 8, sa->sci, MACSEC_SCI_LEN);
++}
++
++static void build_aad(uint8_t aad[MACSEC_AAD_LEN], const uint8_t *macs,
++                      const uint8_t *sectag)
++{
++    memcpy(aad, macs, MAC_ADDRESSES_LEN);
++    memcpy(aad + MAC_ADDRESSES_LEN, sectag, SECTAG_WITH_SCI_LEN);
++}
++
++static void fill_request(struct macsec_crypto_request *request, bool encrypt,
++                         const uint8_t *key, uint32_t ssci, uint64_t pn,
++                         const uint8_t *salt, size_t l2, const uint8_t *input,
++                         size_t input_len, uint8_t *output, uint8_t *tag)
++{
++    request->encrypt = encrypt;
++    request->key = key;
++    make_xpn_nonce(request->nonce, ssci, pn, salt);
++    request->aad = request->aad_storage;
++    request->aad_len = MACSEC_AAD_LEN;
++    request->input = input;
++    request->input_len = input_len;
++    request->output = output;
++    request->tag = tag;
++    request->packet_number = pn;
++    request->l2_len = l2;
++}
++
++/* Monta SecTAG e requisicao com um PN JA reservado; nao altera a SA. */
++static void protect_layout_pn(
++    const struct macsec_tx_sa *sa, uint64_t pn, uint8_t *frame, size_t l2,
++    size_t plain_len, const uint8_t *input, uint8_t *output,
++    size_t *secure_len, struct macsec_crypto_request *request)
++{
++    size_t protected_len = plain_len - l2;
++
++    write_sectag(frame + l2, sa, protected_len, pn);
++    memset(request, 0, sizeof(*request));
++    build_aad(request->aad_storage, frame, frame + l2);
++    fill_request(request, true, sa->key, sa->ssci, pn, sa->salt, l2, input,
++                 protected_len, output, output + protected_len);
++    *secure_len = plain_len + MACSEC_OVERHEAD;
++}
++
++/* secure_frame: DA SA [VLAN] <espaco p/ SecTAG> ET payload <espaco p/ ICV>.
++ * O chamador ja posicionou ET/payload em frame[l2 + 16]. */
++static enum macsec_status protect_layout(
++    struct macsec_tx_sa *sa, uint8_t *frame, size_t l2, size_t plain_len,
++    const uint8_t *input, uint8_t *output, size_t *secure_len,
++    struct macsec_crypto_request *request)
++{
++    uint64_t pn = sa->next_pn;
++
++    protect_layout_pn(sa, pn, frame, l2, plain_len, input, output, secure_len,
++                      request);
++    /* Reservar o PN antes da submissao assincrona evita reutilizar nonce. */
++    sa->next_pn = pn == UINT64_MAX ? 0U : pn + 1U;
++    return MACSEC_OK;
++}
++
++static enum macsec_status protect_check_l2(const struct macsec_tx_sa *sa,
++                                           size_t l2, size_t plain_len,
++                                           size_t capacity)
++{
++    if (sa == NULL || (l2 != MAC_ADDRESSES_LEN && l2 != MAC_ADDRESSES_LEN + VLAN_TAG_LEN) ||
++        plain_len < l2 + 2U) return MACSEC_ERR_ARGUMENT;
++    if (sa->next_pn == 0U) return MACSEC_ERR_PN_EXHAUSTED;
++    if (plain_len > SIZE_MAX - MACSEC_OVERHEAD || capacity < plain_len + MACSEC_OVERHEAD)
++        return MACSEC_ERR_CAPACITY;
++    return MACSEC_OK;
++}
++
++static enum macsec_status protect_check(const struct macsec_tx_sa *sa,
++                                        const uint8_t *frame, size_t plain_len,
++                                        size_t capacity, size_t *l2)
++{
++    if (sa == NULL || frame == NULL) return MACSEC_ERR_ARGUMENT;
++    *l2 = macsec_l2_header_len(frame, plain_len);
++    return protect_check_l2(sa, *l2, plain_len, capacity);
++}
++
++enum macsec_status macsec_prepare_protect(
++    struct macsec_tx_sa *sa, const uint8_t *plain_frame, size_t plain_len,
++    uint8_t *secure_frame, size_t secure_capacity, size_t *secure_len,
++    struct macsec_crypto_request *request)
++{
++    size_t l2;
++    enum macsec_status status;
++
++    if (secure_frame == NULL || secure_len == NULL || request == NULL)
++        return MACSEC_ERR_ARGUMENT;
++    status = protect_check(sa, plain_frame, plain_len, secure_capacity, &l2);
++    if (status != MACSEC_OK) return status;
++    memcpy(secure_frame, plain_frame, l2);
++    return protect_layout(sa, secure_frame, l2, plain_len, plain_frame + l2,
++                          secure_frame + l2 + SECTAG_WITH_SCI_LEN, secure_len,
++                          request);
++}
++
++enum macsec_status macsec_prepare_protect_direct(
++    struct macsec_tx_sa *sa, uint8_t *frame, size_t l2, size_t plain_len,
++    size_t frame_capacity, size_t *secure_len,
++    struct macsec_crypto_request *request)
++{
++    enum macsec_status status;
++
++    if (frame == NULL || secure_len == NULL || request == NULL)
++        return MACSEC_ERR_ARGUMENT;
++    status = protect_check_l2(sa, l2, plain_len, frame_capacity);
++    if (status != MACSEC_OK) return status;
++    return protect_layout(sa, frame, l2, plain_len,
++                          frame + l2 + SECTAG_WITH_SCI_LEN,
++                          frame + l2 + SECTAG_WITH_SCI_LEN, secure_len, request);
++}
++
++enum macsec_status macsec_prepare_protect_direct_pn(
++    const struct macsec_tx_sa *sa, uint64_t pn, uint8_t *frame, size_t l2,
++    size_t plain_len, size_t frame_capacity, size_t *secure_len,
++    struct macsec_crypto_request *request)
++{
++    if (sa == NULL || frame == NULL || secure_len == NULL || request == NULL ||
++        (l2 != MAC_ADDRESSES_LEN && l2 != MAC_ADDRESSES_LEN + VLAN_TAG_LEN) ||
++        plain_len < l2 + 2U) return MACSEC_ERR_ARGUMENT;
++    if (pn == 0U) return MACSEC_ERR_PN_EXHAUSTED;
++    if (plain_len > SIZE_MAX - MACSEC_OVERHEAD ||
++        frame_capacity < plain_len + MACSEC_OVERHEAD) return MACSEC_ERR_CAPACITY;
++    protect_layout_pn(sa, pn, frame, l2, plain_len,
++                      frame + l2 + SECTAG_WITH_SCI_LEN,
++                      frame + l2 + SECTAG_WITH_SCI_LEN, secure_len, request);
++    return MACSEC_OK;
++}
++
++enum macsec_status macsec_prepare_protect_in_place(
++    struct macsec_tx_sa *sa, uint8_t *frame, size_t plain_len,
++    size_t frame_capacity, size_t *secure_len,
++    struct macsec_crypto_request *request)
++{
++    size_t l2;
++    enum macsec_status status;
++
++    if (secure_len == NULL || request == NULL) return MACSEC_ERR_ARGUMENT;
++    status = protect_check(sa, frame, plain_len, frame_capacity, &l2);
++    if (status != MACSEC_OK) return status;
++    memmove(frame + l2 + SECTAG_WITH_SCI_LEN, frame + l2, plain_len - l2);
++    return protect_layout(sa, frame, l2, plain_len,
++                          frame + l2 + SECTAG_WITH_SCI_LEN,
++                          frame + l2 + SECTAG_WITH_SCI_LEN, secure_len, request);
++}
++
++static enum macsec_status parse_secure(const struct macsec_rx_sa *sa,
++                                       const uint8_t *frame, size_t len,
++                                       size_t *l2_out, size_t *protected_len,
++                                       uint64_t *pn)
++{
++    size_t l2;
++    const uint8_t *tag;
++    uint8_t tci;
++    uint8_t short_length;
++
++    if (len < MAC_ADDRESSES_LEN + 2U) return MACSEC_ERR_FORMAT;
++    l2 = is_vlan_ethertype(load_be16(frame + 12)) ? MAC_ADDRESSES_LEN + VLAN_TAG_LEN
++                                                   : MAC_ADDRESSES_LEN;
++    if (len < l2 + SECTAG_WITH_SCI_LEN + 2U + MACSEC_ICV_LEN ||
++        load_be16(frame + l2) != MACSEC_ETHERTYPE) return MACSEC_ERR_FORMAT;
++    tag = frame + l2;
++    tci = tag[2];
++    if ((tci & (TCI_SC | TCI_E | TCI_C)) != TCI_PROFILE ||
++        (tci & TCI_AN_MASK) != sa->association_number ||
++        memcmp(tag + 8, sa->sci, MACSEC_SCI_LEN) != 0) return MACSEC_ERR_FORMAT;
++    *protected_len = len - l2 - SECTAG_WITH_SCI_LEN - MACSEC_ICV_LEN;
++    short_length = tag[3];
++    if ((*protected_len < 48U && short_length != *protected_len) ||
++        (*protected_len >= 48U && short_length != 0U)) return MACSEC_ERR_FORMAT;
++    *pn = recover_xpn(sa, load_be32(tag + 4));
++    if (replay_rejected(sa, *pn)) return MACSEC_ERR_REPLAY;
++    *l2_out = l2;
++    return MACSEC_OK;
++}
++
++enum macsec_status macsec_prepare_unprotect(
++    struct macsec_rx_sa *sa, const uint8_t *secure_frame, size_t secure_len,
++    uint8_t *plain_frame, size_t plain_capacity, size_t *plain_len,
++    struct macsec_crypto_request *request)
++{
++    size_t l2, protected_len;
++    uint64_t pn;
++    enum macsec_status status;
++
++    if (sa == NULL || secure_frame == NULL || plain_frame == NULL ||
++        plain_len == NULL || request == NULL) return MACSEC_ERR_ARGUMENT;
++    status = parse_secure(sa, secure_frame, secure_len, &l2, &protected_len, &pn);
++    if (status != MACSEC_OK) return status;
++    if (plain_capacity < l2 + protected_len) return MACSEC_ERR_CAPACITY;
++    memcpy(plain_frame, secure_frame, l2);
++    memset(request, 0, sizeof(*request));
++    build_aad(request->aad_storage, secure_frame, secure_frame + l2);
++    fill_request(request, false, sa->key, sa->ssci, pn, sa->salt, l2,
++                 secure_frame + l2 + SECTAG_WITH_SCI_LEN, protected_len,
++                 plain_frame + l2,
++                 (uint8_t *)(secure_frame + l2 + SECTAG_WITH_SCI_LEN + protected_len));
++    *plain_len = l2 + protected_len;
++    return MACSEC_OK;
++}
++
++enum macsec_status macsec_complete_unprotect(
++    struct macsec_rx_sa *sa, const struct macsec_crypto_request *request,
++    enum macsec_status crypto_status)
++{
++    if (sa == NULL || request == NULL || request->encrypt) return MACSEC_ERR_ARGUMENT;
++    if (crypto_status != MACSEC_OK) return crypto_status;
++    if (replay_rejected(sa, request->packet_number)) return MACSEC_ERR_REPLAY;
++    replay_accept(sa, request->packet_number);
++    return MACSEC_OK;
++}
++
++enum macsec_status macsec_prepare_unprotect_in_place(
++    struct macsec_rx_sa *sa, uint8_t *frame, size_t secure_len,
++    size_t *plain_len, struct macsec_crypto_request *request)
++{
++    size_t l2, protected_len;
++    uint64_t pn;
++    enum macsec_status status;
++
++    if (sa == NULL || frame == NULL || plain_len == NULL || request == NULL)
++        return MACSEC_ERR_ARGUMENT;
++    status = parse_secure(sa, frame, secure_len, &l2, &protected_len, &pn);
++    if (status != MACSEC_OK) return status;
++    memset(request, 0, sizeof(*request));
++    build_aad(request->aad_storage, frame, frame + l2);
++    fill_request(request, false, sa->key, sa->ssci, pn, sa->salt, l2,
++                 frame + l2 + SECTAG_WITH_SCI_LEN, protected_len,
++                 frame + l2 + SECTAG_WITH_SCI_LEN,
++                 frame + l2 + SECTAG_WITH_SCI_LEN + protected_len);
++    *plain_len = l2 + protected_len;
++    return MACSEC_OK;
++}
++
++enum macsec_status macsec_finish_unprotect_in_place(
++    struct macsec_rx_sa *sa, const struct macsec_crypto_request *request,
++    enum macsec_status crypto_status, uint8_t *frame)
++{
++    enum macsec_status status =
++        macsec_complete_unprotect(sa, request, crypto_status);
++    if (status != MACSEC_OK) return status;
++    memmove(frame + request->l2_len,
++            frame + request->l2_len + SECTAG_WITH_SCI_LEN, request->input_len);
++    return MACSEC_OK;
++}
++
++static enum macsec_status run_backend(const struct macsec_crypto_request *r,
++                                      const uint8_t *tag_in)
++{
++    uint8_t tag[MACSEC_ICV_LEN];
++
++    if (r->encrypt) {
++        if (aead_backend != NULL)
++            return aead_backend(true, r->key, r->nonce, r->aad, r->aad_len,
++                                r->input, r->input_len, r->output, r->tag,
++                                aead_backend_context);
++#ifndef MACSEC_NO_OPENSSL
++        return gcm_encrypt(r->key, r->nonce, r->aad, r->aad_len, r->input,
++                           r->input_len, r->output, r->tag);
++#else
++        return MACSEC_ERR_CRYPTO;
++#endif
++    }
++    memcpy(tag, tag_in, sizeof(tag));
++    if (aead_backend != NULL)
++        return aead_backend(false, r->key, r->nonce, r->aad, r->aad_len,
++                            r->input, r->input_len, r->output, tag,
++                            aead_backend_context);
++#ifndef MACSEC_NO_OPENSSL
++    return gcm_decrypt(r->key, r->nonce, r->aad, r->aad_len, r->input,
++                       r->input_len, tag, r->output);
++#else
++    return MACSEC_ERR_CRYPTO;   /* sem OpenSSL: exige backend (cryptodev) */
++#endif
++}
++
++enum macsec_status macsec_protect(struct macsec_tx_sa *sa,
++                                  const uint8_t *plain_frame,
++                                  size_t plain_len,
++                                  uint8_t *secure_frame,
++                                  size_t secure_capacity,
++                                  size_t *secure_len)
++{
++    struct macsec_crypto_request request;
++    uint64_t saved_pn;
++    enum macsec_status status;
++
++    if (sa == NULL) return MACSEC_ERR_ARGUMENT;
++    saved_pn = sa->next_pn;
++    status = macsec_prepare_protect(sa, plain_frame, plain_len, secure_frame,
++                                    secure_capacity, secure_len, &request);
++    if (status != MACSEC_OK) return status;
++    status = run_backend(&request, NULL);
++    if (status != MACSEC_OK) sa->next_pn = saved_pn;  /* nada saiu na rede */
++    return status;
++}
++
++enum macsec_status macsec_unprotect(struct macsec_rx_sa *sa,
++                                    const uint8_t *secure_frame,
++                                    size_t secure_len,
++                                    uint8_t *plain_frame,
++                                    size_t plain_capacity,
++                                    size_t *plain_len)
++{
++    struct macsec_crypto_request request;
++    enum macsec_status status;
++
++    status = macsec_prepare_unprotect(sa, secure_frame, secure_len, plain_frame,
++                                      plain_capacity, plain_len, &request);
++    if (status != MACSEC_OK) return status;
++    status = run_backend(&request, request.tag);
++    return macsec_complete_unprotect(sa, &request, status);
++}
++
++const char *macsec_status_string(enum macsec_status status)
++{
++    static const char *const names[] = {
++        "ok", "invalid argument", "insufficient capacity", "invalid frame",
++        "authentication failed", "replay rejected", "packet number exhausted",
++        "cryptographic failure"
++    };
++    return status >= MACSEC_OK && status <= MACSEC_ERR_CRYPTO
++               ? names[status]
++               : "unknown status";
++}
+diff --git a/lib/ofh/ethernet/dpdk/macsec/secy_core/macsec.h b/lib/ofh/ethernet/dpdk/macsec/secy_core/macsec.h
+new file mode 100644
+index 0000000..a67ee60
+--- /dev/null
++++ b/lib/ofh/ethernet/dpdk/macsec/secy_core/macsec.h
+@@ -0,0 +1,153 @@
++#ifndef POC_MACSEC_H
++#define POC_MACSEC_H
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++#define MACSEC_KEY_LEN 32U
++#define MACSEC_SALT_LEN 12U
++#define MACSEC_SCI_LEN 8U
++#define MACSEC_ICV_LEN 16U
++#define MACSEC_MAX_REPLAY_WINDOW 64U
++#define MACSEC_ETHERTYPE 0x88E5U
++#define MACSEC_FRAME_OVERHEAD 32U
++#define MACSEC_SECTAG_LEN 16U
++#define MACSEC_AAD_LEN 28U       /* DA SA 88E5 TCI SL PN SCI */
++#define MACSEC_MAX_L2_LEN 16U    /* DA SA + uma tag 802.1Q/802.1ad */
++
++enum macsec_status {
++    MACSEC_OK = 0,
++    MACSEC_ERR_ARGUMENT,
++    MACSEC_ERR_CAPACITY,
++    MACSEC_ERR_FORMAT,
++    MACSEC_ERR_AUTH,
++    MACSEC_ERR_REPLAY,
++    MACSEC_ERR_PN_EXHAUSTED,
++    MACSEC_ERR_CRYPTO
++};
++
++typedef enum macsec_status (*macsec_aead_backend_fn)(
++    bool encrypt, const uint8_t key[MACSEC_KEY_LEN], const uint8_t nonce[12],
++    const uint8_t *aad, size_t aad_len, const uint8_t *input, size_t input_len,
++    uint8_t *output, uint8_t tag[MACSEC_ICV_LEN], void *context);
++
++void macsec_set_aead_backend(macsec_aead_backend_fn backend, void *context);
++
++struct macsec_tx_sa {
++    uint8_t key[MACSEC_KEY_LEN];
++    uint8_t sci[MACSEC_SCI_LEN];
++    uint8_t salt[MACSEC_SALT_LEN];
++    uint64_t next_pn;
++    uint32_t ssci;
++    uint8_t association_number;
++};
++
++struct macsec_rx_sa {
++    uint8_t key[MACSEC_KEY_LEN];
++    uint8_t sci[MACSEC_SCI_LEN];
++    uint8_t salt[MACSEC_SALT_LEN];
++    uint64_t highest_pn;
++    uint32_t ssci;
++    uint64_t replay_bitmap;
++    uint8_t association_number;
++    uint8_t replay_window;
++};
++
++struct macsec_crypto_request {
++    bool encrypt;
++    const uint8_t *key;
++    uint8_t nonce[12];
++    const uint8_t *aad;
++    size_t aad_len;
++    const uint8_t *input;
++    size_t input_len;
++    uint8_t *output;
++    uint8_t *tag;
++    uint64_t packet_number;
++    size_t l2_len;                       /* DA SA [VLAN], antes do SecTAG */
++    uint8_t aad_storage[MACSEC_AAD_LEN]; /* aad aponta aqui: nao copiar o struct
++                                            sem refazer o ponteiro */
++};
++
++void macsec_tx_sa_init(struct macsec_tx_sa *sa,
++                       const uint8_t key[MACSEC_KEY_LEN],
++                       const uint8_t sci[MACSEC_SCI_LEN],
++                       const uint8_t salt[MACSEC_SALT_LEN], uint32_t ssci,
++                       uint8_t association_number,
++                       uint64_t initial_pn);
++
++void macsec_rx_sa_init(struct macsec_rx_sa *sa,
++                       const uint8_t key[MACSEC_KEY_LEN],
++                       const uint8_t sci[MACSEC_SCI_LEN],
++                       const uint8_t salt[MACSEC_SALT_LEN], uint32_t ssci,
++                       uint8_t association_number,
++                       uint8_t replay_window);
++
++enum macsec_status macsec_protect(struct macsec_tx_sa *sa,
++                                  const uint8_t *plain_frame,
++                                  size_t plain_len,
++                                  uint8_t *secure_frame,
++                                  size_t secure_capacity,
++                                  size_t *secure_len);
++
++enum macsec_status macsec_unprotect(struct macsec_rx_sa *sa,
++                                    const uint8_t *secure_frame,
++                                    size_t secure_len,
++                                    uint8_t *plain_frame,
++                                    size_t plain_capacity,
++                                    size_t *plain_len);
++
++enum macsec_status macsec_prepare_protect(
++    struct macsec_tx_sa *sa, const uint8_t *plain_frame, size_t plain_len,
++    uint8_t *secure_frame, size_t secure_capacity, size_t *secure_len,
++    struct macsec_crypto_request *request);
++
++enum macsec_status macsec_prepare_unprotect(
++    struct macsec_rx_sa *sa, const uint8_t *secure_frame, size_t secure_len,
++    uint8_t *plain_frame, size_t plain_capacity, size_t *plain_len,
++    struct macsec_crypto_request *request);
++
++enum macsec_status macsec_complete_unprotect(
++    struct macsec_rx_sa *sa, const struct macsec_crypto_request *request,
++    enum macsec_status crypto_status);
++
++enum macsec_status macsec_prepare_protect_in_place(
++    struct macsec_tx_sa *sa, uint8_t *frame, size_t plain_len,
++    size_t frame_capacity, size_t *secure_len,
++    struct macsec_crypto_request *request);
++
++/* Tamanho de DA SA [VLAN] de um quadro em claro (12 ou 16); 0 se invalido. */
++size_t macsec_l2_header_len(const uint8_t *frame, size_t len);
++
++/* true se o quadro tem SecTAG (apos DA SA [VLAN]); devolve o AN. */
++bool macsec_peek_secure(const uint8_t *frame, size_t len, uint8_t *an);
++
++/* Layout: DA SA [VLAN] ocupam frame[0..l2-1]; o SecTAG (16 B) vai em
++ * frame[l2..l2+15] e o EtherType/payload original ja esta em frame[l2+16].
++ * plain_len e o tamanho do quadro em claro (l2 + EtherType + payload). */
++enum macsec_status macsec_prepare_protect_direct(
++    struct macsec_tx_sa *sa, uint8_t *frame, size_t l2, size_t plain_len,
++    size_t frame_capacity, size_t *secure_len,
++    struct macsec_crypto_request *request);
++
++/* Como o _direct, mas SEM estado: o PN (nao zero) ja foi reservado pelo chamador
++ * (por exemplo, com um fetch_add atomico) e a SA nao e modificada. Permite varias
++ * threads de TX usarem a mesma SA. A recepcao continua exigindo uma unica thread
++ * por SA (a janela anti-replay e estado mutavel). */
++enum macsec_status macsec_prepare_protect_direct_pn(
++    const struct macsec_tx_sa *sa, uint64_t pn, uint8_t *frame, size_t l2,
++    size_t plain_len, size_t frame_capacity, size_t *secure_len,
++    struct macsec_crypto_request *request);
++
++enum macsec_status macsec_prepare_unprotect_in_place(
++    struct macsec_rx_sa *sa, uint8_t *frame, size_t secure_len,
++    size_t *plain_len, struct macsec_crypto_request *request);
++
++enum macsec_status macsec_finish_unprotect_in_place(
++    struct macsec_rx_sa *sa, const struct macsec_crypto_request *request,
++    enum macsec_status crypto_status, uint8_t *frame);
++
++const char *macsec_status_string(enum macsec_status status);
++
++#endif
+-- 
+2.56.0
+

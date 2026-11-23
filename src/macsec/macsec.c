@@ -1,7 +1,9 @@
 #include "macsec.h"
 
 #include <limits.h>
+#ifndef MACSEC_NO_OPENSSL
 #include <openssl/evp.h>
+#endif
 #include <string.h>
 
 #define ETHERNET_HEADER_LEN 14U
@@ -121,6 +123,7 @@ static void replay_accept(struct macsec_rx_sa *sa, uint64_t pn)
     }
 }
 
+#ifndef MACSEC_NO_OPENSSL
 static enum macsec_status gcm_encrypt(const uint8_t key[MACSEC_KEY_LEN],
                                       const uint8_t nonce[12],
                                       const uint8_t *aad,
@@ -187,6 +190,8 @@ done:
     EVP_CIPHER_CTX_free(ctx);
     return status;
 }
+
+#endif /* MACSEC_NO_OPENSSL */
 
 void macsec_tx_sa_init(struct macsec_tx_sa *sa,
                        const uint8_t key[MACSEC_KEY_LEN],
@@ -289,15 +294,13 @@ static void fill_request(struct macsec_crypto_request *request, bool encrypt,
     request->l2_len = l2;
 }
 
-/* secure_frame: DA SA [VLAN] <espaco p/ SecTAG> ET payload <espaco p/ ICV>.
- * O chamador ja posicionou ET/payload em frame[l2 + 16]. */
-static enum macsec_status protect_layout(
-    struct macsec_tx_sa *sa, uint8_t *frame, size_t l2, size_t plain_len,
-    const uint8_t *input, uint8_t *output, size_t *secure_len,
-    struct macsec_crypto_request *request)
+/* Monta SecTAG e requisicao com um PN JA reservado; nao altera a SA. */
+static void protect_layout_pn(
+    const struct macsec_tx_sa *sa, uint64_t pn, uint8_t *frame, size_t l2,
+    size_t plain_len, const uint8_t *input, uint8_t *output,
+    size_t *secure_len, struct macsec_crypto_request *request)
 {
     size_t protected_len = plain_len - l2;
-    uint64_t pn = sa->next_pn;
 
     write_sectag(frame + l2, sa, protected_len, pn);
     memset(request, 0, sizeof(*request));
@@ -305,6 +308,19 @@ static enum macsec_status protect_layout(
     fill_request(request, true, sa->key, sa->ssci, pn, sa->salt, l2, input,
                  protected_len, output, output + protected_len);
     *secure_len = plain_len + MACSEC_OVERHEAD;
+}
+
+/* secure_frame: DA SA [VLAN] <espaco p/ SecTAG> ET payload <espaco p/ ICV>.
+ * O chamador ja posicionou ET/payload em frame[l2 + 16]. */
+static enum macsec_status protect_layout(
+    struct macsec_tx_sa *sa, uint8_t *frame, size_t l2, size_t plain_len,
+    const uint8_t *input, uint8_t *output, size_t *secure_len,
+    struct macsec_crypto_request *request)
+{
+    uint64_t pn = sa->next_pn;
+
+    protect_layout_pn(sa, pn, frame, l2, plain_len, input, output, secure_len,
+                      request);
     /* Reservar o PN antes da submissao assincrona evita reutilizar nonce. */
     sa->next_pn = pn == UINT64_MAX ? 0U : pn + 1U;
     return MACSEC_OK;
@@ -363,6 +379,23 @@ enum macsec_status macsec_prepare_protect_direct(
     return protect_layout(sa, frame, l2, plain_len,
                           frame + l2 + SECTAG_WITH_SCI_LEN,
                           frame + l2 + SECTAG_WITH_SCI_LEN, secure_len, request);
+}
+
+enum macsec_status macsec_prepare_protect_direct_pn(
+    const struct macsec_tx_sa *sa, uint64_t pn, uint8_t *frame, size_t l2,
+    size_t plain_len, size_t frame_capacity, size_t *secure_len,
+    struct macsec_crypto_request *request)
+{
+    if (sa == NULL || frame == NULL || secure_len == NULL || request == NULL ||
+        (l2 != MAC_ADDRESSES_LEN && l2 != MAC_ADDRESSES_LEN + VLAN_TAG_LEN) ||
+        plain_len < l2 + 2U) return MACSEC_ERR_ARGUMENT;
+    if (pn == 0U) return MACSEC_ERR_PN_EXHAUSTED;
+    if (plain_len > SIZE_MAX - MACSEC_OVERHEAD ||
+        frame_capacity < plain_len + MACSEC_OVERHEAD) return MACSEC_ERR_CAPACITY;
+    protect_layout_pn(sa, pn, frame, l2, plain_len,
+                      frame + l2 + SECTAG_WITH_SCI_LEN,
+                      frame + l2 + SECTAG_WITH_SCI_LEN, secure_len, request);
+    return MACSEC_OK;
 }
 
 enum macsec_status macsec_prepare_protect_in_place(
@@ -488,20 +521,28 @@ static enum macsec_status run_backend(const struct macsec_crypto_request *r,
     uint8_t tag[MACSEC_ICV_LEN];
 
     if (r->encrypt) {
-        return aead_backend != NULL
-                   ? aead_backend(true, r->key, r->nonce, r->aad, r->aad_len,
-                                  r->input, r->input_len, r->output, r->tag,
-                                  aead_backend_context)
-                   : gcm_encrypt(r->key, r->nonce, r->aad, r->aad_len, r->input,
-                                 r->input_len, r->output, r->tag);
+        if (aead_backend != NULL)
+            return aead_backend(true, r->key, r->nonce, r->aad, r->aad_len,
+                                r->input, r->input_len, r->output, r->tag,
+                                aead_backend_context);
+#ifndef MACSEC_NO_OPENSSL
+        return gcm_encrypt(r->key, r->nonce, r->aad, r->aad_len, r->input,
+                           r->input_len, r->output, r->tag);
+#else
+        return MACSEC_ERR_CRYPTO;
+#endif
     }
     memcpy(tag, tag_in, sizeof(tag));
-    return aead_backend != NULL
-               ? aead_backend(false, r->key, r->nonce, r->aad, r->aad_len,
-                              r->input, r->input_len, r->output, tag,
-                              aead_backend_context)
-               : gcm_decrypt(r->key, r->nonce, r->aad, r->aad_len, r->input,
-                             r->input_len, tag, r->output);
+    if (aead_backend != NULL)
+        return aead_backend(false, r->key, r->nonce, r->aad, r->aad_len,
+                            r->input, r->input_len, r->output, tag,
+                            aead_backend_context);
+#ifndef MACSEC_NO_OPENSSL
+    return gcm_decrypt(r->key, r->nonce, r->aad, r->aad_len, r->input,
+                       r->input_len, tag, r->output);
+#else
+    return MACSEC_ERR_CRYPTO;   /* sem OpenSSL: exige backend (cryptodev) */
+#endif
 }
 
 enum macsec_status macsec_protect(struct macsec_tx_sa *sa,
